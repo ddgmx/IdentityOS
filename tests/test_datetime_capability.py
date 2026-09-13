@@ -51,6 +51,50 @@ def test_convert_iana_timezone_applies_daylight_saving_rules():
     assert winter.data["difference_hours"] == 6
 
 
+def test_convert_rejects_nonexistent_dst_wall_time():
+    result = DateTimeCapability().call(
+        "datetime.convert",
+        dt_str="2026-03-08 02:30:00",
+        from_tz="America/Chicago",
+        to_tz="UTC",
+    )
+
+    assert result.success is False
+    assert result.error["type"] == "ValueError"
+    assert "Nonexistent local time" in result.error["message"]
+
+
+def test_convert_requires_offset_for_ambiguous_dst_wall_time():
+    capability = DateTimeCapability()
+    ambiguous = capability.call(
+        "datetime.convert",
+        dt_str="2026-11-01 01:30:00",
+        from_tz="America/Chicago",
+        to_tz="UTC",
+    )
+    daylight = capability.call(
+        "datetime.convert",
+        dt_str="2026-11-01T01:30:00-05:00",
+        from_tz="America/Chicago",
+        to_tz="UTC",
+    )
+    standard = capability.call(
+        "datetime.convert",
+        dt_str="2026-11-01T01:30:00-06:00",
+        from_tz="America/Chicago",
+        to_tz="UTC",
+    )
+
+    assert ambiguous.success is False
+    assert ambiguous.error["type"] == "ValueError"
+    assert "Ambiguous local time" in ambiguous.error["message"]
+    assert "explicit UTC offset" in ambiguous.error["message"]
+    assert daylight.success is True
+    assert daylight.data["output"]["datetime"] == "2026-11-01 06:30:00"
+    assert standard.success is True
+    assert standard.data["output"]["datetime"] == "2026-11-01 07:30:00"
+
+
 def test_fixed_abbreviations_remain_backward_compatible():
     result = DateTimeCapability().call(
         "datetime.convert",

@@ -143,6 +143,38 @@ class DateTimeCapability(Capability):
         offset = value.utcoffset()
         return offset.total_seconds() / 3600 if offset is not None else 0.0
 
+    @staticmethod
+    def _localize(value: datetime, zone: tzinfo, label: str) -> datetime:
+        if value.tzinfo is not None:
+            return value.astimezone(zone)
+
+        first = value.replace(tzinfo=zone, fold=0)
+        second = value.replace(tzinfo=zone, fold=1)
+        if first.utcoffset() == second.utcoffset():
+            return first
+
+        def round_trips(candidate: datetime) -> bool:
+            return (
+                candidate.astimezone(timezone.utc)
+                .astimezone(zone)
+                .replace(tzinfo=None)
+                == value
+            )
+
+        first_valid = round_trips(first)
+        second_valid = round_trips(second)
+        if first_valid and second_valid:
+            raise ValueError(
+                f"Ambiguous local time {value.isoformat(sep=' ')} in {label}. "
+                "Include an explicit UTC offset in dt_str."
+            )
+        if not first_valid and not second_valid:
+            raise ValueError(
+                f"Nonexistent local time {value.isoformat(sep=' ')} in {label} "
+                "due to a timezone transition."
+            )
+        return first if first_valid else second
+
     def _now(self, tz_name: str = "UTC", **kwargs: Any) -> dict[str, Any]:
         tz, label = self._timezone(tz_name)
         now = datetime.now(tz)
@@ -163,11 +195,7 @@ class DateTimeCapability(Capability):
         source_tz, source_label = self._timezone(from_tz)
         target_tz, target_label = self._timezone(to_tz)
         dt = datetime.fromisoformat(dt_str) if dt_str else datetime.now()
-        source = (
-            dt.replace(tzinfo=source_tz)
-            if dt.tzinfo is None
-            else dt.astimezone(source_tz)
-        )
+        source = self._localize(dt, source_tz, source_label)
         converted = source.astimezone(target_tz)
         delta = self._offset_hours(converted) - self._offset_hours(source)
         return {
