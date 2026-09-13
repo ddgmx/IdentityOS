@@ -69,6 +69,7 @@ def test_marketplace_only_advertises_registered_conformant_capabilities():
         }
 
         assert entry["url"] == f"{entry['id']}/manifest.json"
+        assert entry["version"] == manifest["version"] == capability.version
         assert entry["skills"] == len(runtime_skills)
         assert manifest["id"] == entry["id"]
         assert manifest_skills == runtime_skills
@@ -92,9 +93,11 @@ def test_fresh_identity_installs_all_capabilities_and_reloads_them(tmp_path):
 
     restarted = CapabilityRegistry(JSONFileBackend(root_dir=str(store_path)))
     assert [capability.id for capability in restarted.list(identity_id)] == expected
-    result = restarted.call(identity_id, "datetime.now", tz_name="UTC")
+    result = restarted.call(
+        identity_id, "datetime.now", tz_name="America/Chicago"
+    )
     assert result.success is True
-    assert result.data["timezone"] == "UTC"
+    assert result.data["timezone"] == "America/Chicago"
 
 
 def test_analysis_capabilities_report_absent_benchmarks_as_observed_no_data(
