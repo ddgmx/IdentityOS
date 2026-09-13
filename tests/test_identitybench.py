@@ -648,6 +648,16 @@ class TestBenchmarkProvenance:
         assert "if: always() && !cancelled() && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'" in pr_workflow
         assert "Report benchmark runtime failure after preserving evidence" in pr_workflow
         assert "No score or champion promotion is claimed" in pr_workflow
+        retry_step = pr_workflow.index("- name: Run IdentityBench smoke suite")
+        upload_step = pr_workflow.index("- name: Upload benchmark artifacts")
+        comment_step = pr_workflow.index("- name: Comment benchmark summary on PR")
+        failure_step = pr_workflow.index(
+            "- name: Report benchmark runtime failure after preserving evidence"
+        )
+        assert retry_step < upload_step < comment_step < failure_step
+        failure_block = pr_workflow[failure_step:]
+        assert "steps.benchmark-runtime.outcome == 'failure'" in failure_block
+        assert "exit 1" in failure_block
         assert "--baseline champion" in pr_workflow
         assert "--baseline champion" in scheduled
         assert "regression-check.txt" in pr_workflow

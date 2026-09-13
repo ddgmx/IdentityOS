@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -107,6 +108,53 @@ def test_non_rate_limit_failure_is_not_retried_and_state_is_restored(
     assert calls == 1
     assert (state / "baseline.txt").read_text() == "baseline"
     assert not (state / "invalid.json").exists()
+
+
+def test_real_subprocess_recovers_from_one_transient_provider_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    state = tmp_path / ".identitybench"
+    state.mkdir()
+    (state / "baseline.txt").write_text("baseline")
+    helper = tmp_path / "transient_provider.py"
+    helper.write_text(
+        """from pathlib import Path
+counter = Path("attempt-count.txt")
+attempt = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(attempt))
+if attempt == 1:
+    Path(".identitybench/partial.json").write_text("partial")
+    print("All keys on cooldown (shortest 1s). Falling through.")
+    raise SystemExit(1)
+assert not Path(".identitybench/partial.json").exists()
+assert Path(".identitybench/baseline.txt").read_text() == "baseline"
+Path(".identitybench/completed.json").write_text("completed")
+print("provider benchmark completed")
+"""
+    )
+    waits: list[float] = []
+
+    result = ci_retry.run_with_retry(
+        [sys.executable, str(helper)],
+        attempts=2,
+        max_wait_seconds=5,
+        retry_grace_seconds=0,
+        state_paths=(".identitybench",),
+        sleep_fn=waits.append,
+    )
+
+    assert result == 0
+    assert waits == [1]
+    assert (tmp_path / "attempt-count.txt").read_text() == "2"
+    assert (state / "completed.json").read_text() == "completed"
+    assert (
+        tmp_path
+        / "benchmark-failure-state"
+        / "attempt-1"
+        / "0-.identitybench"
+        / "partial.json"
+    ).read_text() == "partial"
 
 
 def test_retry_rejects_state_paths_outside_workspace(
