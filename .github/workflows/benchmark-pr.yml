@@ -84,6 +84,8 @@ jobs:
 
       - name: Run IdentityBench smoke suite
         if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
+        id: benchmark-runtime
+        continue-on-error: true
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
@@ -91,27 +93,34 @@ jobs:
           GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          set -o pipefail
-          identitybench run ${{ env.BENCHMARK_IDENTITY }} --mode smoke --seed 42 2>&1 | tee benchmark-results.txt
+          python -m identitybench.ci_retry \
+            --attempts 2 \
+            --max-wait-seconds 900 \
+            --retry-grace-seconds 30 \
+            --results-path benchmark-results.txt \
+            --state-path .identity_store \
+            --state-path .identitybench \
+            --failure-root benchmark-failure-state \
+            -- identitybench run ${{ env.BENCHMARK_IDENTITY }} --mode smoke --seed 42
           identitybench report ${{ env.BENCHMARK_IDENTITY }} --markdown -o benchmark-report.md
           identitybench endurance report ${{ env.BENCHMARK_IDENTITY }} -o endurance-report.md
 
       - name: Compare against restored benchmark history
-        if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
+        if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true' && steps.benchmark-runtime.outcome == 'success'
         id: compare
         run: |
           set -o pipefail
           identitybench compare --id ${{ env.BENCHMARK_IDENTITY }} --last 2 --baseline champion 2>&1 | tee regression-check.txt
 
       - name: Report advisory regression observations
-        if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
+        if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true' && steps.benchmark-runtime.outcome == 'success'
         run: |
           if [ -f regression-check.txt ] && grep -q "REGRESSION" regression-check.txt; then
             echo "::warning::Single-run score regression against the verified observed champion. The champion was retained; only the protected paired gate has promotion authority."
           fi
 
       - name: Upload benchmark artifacts
-        if: env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
+        if: always() && !cancelled() && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
@@ -122,11 +131,16 @@ jobs:
             benchmark-results.txt
             endurance-report.md
             regression-check.txt
+            benchmark-failure-state/
+            test-results.txt
+            integration-results.txt
             .identitybench/
 
       - name: Comment benchmark summary on PR
-        if: github.event_name == 'pull_request' && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
+        if: always() && !cancelled() && github.event_name == 'pull_request' && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'
         uses: actions/github-script@v7
+        env:
+          BENCHMARK_OUTCOME: ${{ steps.benchmark-runtime.outcome }}
         with:
           script: |
             const fs = require('fs');
@@ -135,7 +149,10 @@ jobs:
               const results = fs.readFileSync('benchmark-results.txt', 'utf8');
               summary = '## IdentityBench Results\n```\n' + results.slice(-1500) + '\n```\n';
             } catch(e) {
-              summary = '## IdentityBench Results\n_Benchmark completed but summary unavailable._\n';
+              summary = '## IdentityBench Results\n_Benchmark output unavailable._\n';
+            }
+            if (process.env.BENCHMARK_OUTCOME !== 'success') {
+              summary += '\n_Provider benchmark failed after its bounded retry. No score or champion promotion is claimed; failure evidence is attached to the workflow run._\n';
             }
             try {
               const report = fs.readFileSync('benchmark-report.md', 'utf8');
@@ -157,6 +174,12 @@ jobs:
               repo: context.repo.repo,
               body: summary
             });
+
+      - name: Report benchmark runtime failure after preserving evidence
+        if: always() && env.CAN_RUN_PROVIDER_BENCHMARK == 'true' && steps.benchmark-runtime.outcome == 'failure'
+        run: |
+          echo "::error::Provider benchmark failed after a bounded clean-state retry; raw evidence was preserved."
+          exit 1
 
       - name: Explain fork benchmark boundary
         if: github.event_name == 'pull_request' && env.CAN_RUN_PROVIDER_BENCHMARK != 'true'

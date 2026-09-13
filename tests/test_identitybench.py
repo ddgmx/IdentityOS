@@ -635,10 +635,19 @@ class TestBenchmarkProvenance:
         assert "identity inspect ${{ env.BENCHMARK_IDENTITY }}" not in scheduled
         assert (
             "- name: Comment benchmark summary on PR\n"
-            "        if: github.event_name == 'pull_request'"
+            "        if: always() && !cancelled() && "
+            "github.event_name == 'pull_request'"
         ) in pr_workflow
         assert "Report advisory regression observations" in pr_workflow
         assert "Single-run score regression against the verified observed champion" in pr_workflow
+        assert "python -m identitybench.ci_retry" in pr_workflow
+        assert "--attempts 2" in pr_workflow
+        assert "--max-wait-seconds 900" in pr_workflow
+        assert "continue-on-error: true" in pr_workflow
+        assert "benchmark-failure-state/" in pr_workflow
+        assert "if: always() && !cancelled() && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'" in pr_workflow
+        assert "Report benchmark runtime failure after preserving evidence" in pr_workflow
+        assert "No score or champion promotion is claimed" in pr_workflow
         assert "--baseline champion" in pr_workflow
         assert "--baseline champion" in scheduled
         assert "regression-check.txt" in pr_workflow
