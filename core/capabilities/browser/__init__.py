@@ -31,6 +31,7 @@ from .session import (
     run_in_browser_thread,
 )
 from .url_policy import validate_navigation_url
+from .nl_interface import create_nl_interface
 
 _SECRET_KEYS = {"password", "passwd", "pass", "secret", "token", "api_key"}
 _EXECUTION_SCOPE: ContextVar[str] = ContextVar(
@@ -143,6 +144,13 @@ class BrowserCapability(Capability):
 
     def on_identity_loaded(self, identity_id: str) -> None:
         self._identity_id = identity_id
+
+    @property
+    def nl(self) -> "BrowserNLInterface":
+        """Natural language interface for high-level browser commands."""
+        if not hasattr(self, "_nl_interface"):
+            self._nl_interface = create_nl_interface(self)
+        return self._nl_interface
 
     def prompts(self, identity_id: str) -> list[str]:
         return [
