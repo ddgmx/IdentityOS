@@ -1,6 +1,6 @@
 """Bounded, evidence-preserving retries for provider-backed CI benchmarks.
 
-This module belongs to CI orchestration rather than an adapter. Interactive
+This script belongs to CI orchestration rather than an adapter. Interactive
 runtime calls must stay responsive; a benchmark job can instead wait for a
 provider-advertised cooldown and retry from the exact same persisted state.
 """

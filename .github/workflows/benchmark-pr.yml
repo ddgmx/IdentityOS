@@ -93,7 +93,7 @@ jobs:
           GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          python -m identitybench.ci_retry \
+          python scripts/benchmark_ci_retry.py \
             --attempts 2 \
             --max-wait-seconds 900 \
             --retry-grace-seconds 30 \

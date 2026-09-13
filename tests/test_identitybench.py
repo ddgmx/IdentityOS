@@ -640,7 +640,7 @@ class TestBenchmarkProvenance:
         ) in pr_workflow
         assert "Report advisory regression observations" in pr_workflow
         assert "Single-run score regression against the verified observed champion" in pr_workflow
-        assert "python -m identitybench.ci_retry" in pr_workflow
+        assert "python scripts/benchmark_ci_retry.py" in pr_workflow
         assert "--attempts 2" in pr_workflow
         assert "--max-wait-seconds 900" in pr_workflow
         assert "continue-on-error: true" in pr_workflow

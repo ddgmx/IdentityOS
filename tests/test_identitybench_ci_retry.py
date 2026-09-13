@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from identitybench import ci_retry
+from scripts import benchmark_ci_retry as ci_retry
 
 
 def test_provider_wait_uses_longest_advertised_cooldown() -> None:
