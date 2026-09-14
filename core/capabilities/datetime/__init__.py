@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from core.capabilities.base import Capability, Skill, object_schema
 from core.capabilities.registry import register
@@ -27,7 +28,7 @@ _KNOWN_ZONES = {
 class DateTimeCapability(Capability):
     id = "datetime"
     name = "DateTime"
-    version = "1.0.0"
+    version = "1.1.0"
     author = "IdentityOS"
     license = "MIT"
     homepage = "https://github.com/lacebx/IdentityOS"
@@ -51,10 +52,42 @@ class DateTimeCapability(Capability):
         ]
 
     _SKILLS = [
-        Skill(name="datetime.now", description="Get current date and time in a timezone", permission="public", input_schema=object_schema({"tz_name": {"type": "string"}}), verification_params={"tz_name": "UTC"}),
-        Skill(name="datetime.convert", description="Convert a time between timezones", permission="public", input_schema=object_schema({"dt_str": {"type": "string"}, "from_tz": {"type": "string"}, "to_tz": {"type": "string"}}, required=("dt_str", "from_tz", "to_tz"))),
-        Skill(name="datetime.diff", description="Calculate days between two dates", permission="public", input_schema=object_schema({"date1": {"type": "string"}, "date2": {"type": "string"}}, required=("date1", "date2"))),
-        Skill(name="datetime.zones", description="List all supported timezone codes", permission="public", input_schema=object_schema(), verification_params={}),
+        Skill(
+            name="datetime.now",
+            description="Get current date and time in a timezone",
+            permission="public",
+            input_schema=object_schema({"tz_name": {"type": "string"}}),
+            verification_params={"tz_name": "UTC"},
+        ),
+        Skill(
+            name="datetime.convert",
+            description="Convert a time between timezones",
+            permission="public",
+            input_schema=object_schema(
+                {
+                    "dt_str": {"type": "string"},
+                    "from_tz": {"type": "string"},
+                    "to_tz": {"type": "string"},
+                },
+                required=("dt_str", "from_tz", "to_tz"),
+            ),
+        ),
+        Skill(
+            name="datetime.diff",
+            description="Calculate days between two dates",
+            permission="public",
+            input_schema=object_schema(
+                {"date1": {"type": "string"}, "date2": {"type": "string"}},
+                required=("date1", "date2"),
+            ),
+        ),
+        Skill(
+            name="datetime.zones",
+            description="Describe supported timezone identifiers",
+            permission="public",
+            input_schema=object_schema(),
+            verification_params={},
+        ),
     ]
 
     def skills(self) -> list[Skill]:
@@ -74,39 +107,102 @@ class DateTimeCapability(Capability):
             if handler is None:
                 return CapabilityResult.fail("datetime", skill_name, "unknown_skill", f"Unknown skill: {skill_name}")
             data = handler(**params)
-            return CapabilityResult.from_data("datetime", skill_name, data, source="system clock", duration_ms=(_time.monotonic() - _t0) * 1000)
+            return CapabilityResult.from_data(
+                "datetime",
+                skill_name,
+                data,
+                source="system clock",
+                duration_ms=(_time.monotonic() - _t0) * 1000,
+            )
         except Exception as e:
-            return CapabilityResult.fail("datetime", skill_name, type(e).__name__, str(e), duration_ms=(_time.monotonic() - _t0) * 1000)
+            return CapabilityResult.fail(
+                "datetime",
+                skill_name,
+                type(e).__name__,
+                str(e),
+                duration_ms=(_time.monotonic() - _t0) * 1000,
+            )
 
     @staticmethod
-    def _utc_offset(tz_name: str) -> float:
-        upper = tz_name.upper().strip()
+    def _timezone(tz_name: str) -> tuple[tzinfo, str]:
+        cleaned = tz_name.strip()
+        upper = cleaned.upper()
         if upper in _KNOWN_ZONES:
-            return _KNOWN_ZONES[upper]
-        raise ValueError(f"Unknown timezone: {tz_name}. Supported: {', '.join(_KNOWN_ZONES.keys())}")
+            return timezone(timedelta(hours=_KNOWN_ZONES[upper])), upper
+        try:
+            return ZoneInfo(cleaned), cleaned
+        except (ZoneInfoNotFoundError, ValueError):
+            abbreviations = ", ".join(_KNOWN_ZONES)
+            raise ValueError(
+                f"Unknown timezone: {tz_name}. Use an IANA timezone such as "
+                f"America/Chicago or one of: {abbreviations}"
+            ) from None
+
+    @staticmethod
+    def _offset_hours(value: datetime) -> float:
+        offset = value.utcoffset()
+        return offset.total_seconds() / 3600 if offset is not None else 0.0
+
+    @staticmethod
+    def _localize(value: datetime, zone: tzinfo, label: str) -> datetime:
+        if value.tzinfo is not None:
+            return value.astimezone(zone)
+
+        first = value.replace(tzinfo=zone, fold=0)
+        second = value.replace(tzinfo=zone, fold=1)
+        if first.utcoffset() == second.utcoffset():
+            return first
+
+        def round_trips(candidate: datetime) -> bool:
+            return (
+                candidate.astimezone(timezone.utc)
+                .astimezone(zone)
+                .replace(tzinfo=None)
+                == value
+            )
+
+        first_valid = round_trips(first)
+        second_valid = round_trips(second)
+        if first_valid and second_valid:
+            raise ValueError(
+                f"Ambiguous local time {value.isoformat(sep=' ')} in {label}. "
+                "Include an explicit UTC offset in dt_str."
+            )
+        if not first_valid and not second_valid:
+            raise ValueError(
+                f"Nonexistent local time {value.isoformat(sep=' ')} in {label} "
+                "due to a timezone transition."
+            )
+        return first if first_valid else second
 
     def _now(self, tz_name: str = "UTC", **kwargs: Any) -> dict[str, Any]:
-        offset = self._utc_offset(tz_name)
-        tz = timezone(timedelta(hours=offset))
+        tz, label = self._timezone(tz_name)
         now = datetime.now(tz)
         return {
-            "timezone": tz_name.upper(),
+            "timezone": label,
             "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "utc_offset_hours": offset,
+            "utc_offset_hours": self._offset_hours(now),
             "weekday": now.strftime("%A"),
         }
 
-    def _convert(self, dt_str: str = "", from_tz: str = "UTC", to_tz: str = "UTC", **kwargs: Any) -> dict[str, Any]:
-        from_offset = self._utc_offset(from_tz)
-        to_offset = self._utc_offset(to_tz)
+    def _convert(
+        self,
+        dt_str: str = "",
+        from_tz: str = "UTC",
+        to_tz: str = "UTC",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        source_tz, source_label = self._timezone(from_tz)
+        target_tz, target_label = self._timezone(to_tz)
         dt = datetime.fromisoformat(dt_str) if dt_str else datetime.now()
-        delta = to_offset - from_offset
-        converted = dt + timedelta(hours=delta)
+        source = self._localize(dt, source_tz, source_label)
+        converted = source.astimezone(target_tz)
+        delta = self._offset_hours(converted) - self._offset_hours(source)
         return {
-            "input": {"datetime": dt_str, "timezone": from_tz.upper()},
+            "input": {"datetime": dt_str, "timezone": source_label},
             "output": {
                 "datetime": converted.strftime("%Y-%m-%d %H:%M:%S"),
-                "timezone": to_tz.upper(),
+                "timezone": target_label,
             },
             "difference_hours": delta,
         }
@@ -125,4 +221,9 @@ class DateTimeCapability(Capability):
 
     @staticmethod
     def _zones(**kwargs: Any) -> dict[str, Any]:
-        return {"timezones": _KNOWN_ZONES}
+        return {
+            "timezones": _KNOWN_ZONES,
+            "iana_timezones_supported": True,
+            "iana_format": "Area/Location",
+            "iana_examples": ["America/Chicago", "Europe/London", "Asia/Tokyo"],
+        }
