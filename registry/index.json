@@ -320,7 +320,7 @@
     {
       "id": "registry_manager",
       "name": "Registry Manager",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "List, publish, and install capabilities from the registry",
       "skills": [
         "registry_manager.list_capabilities",

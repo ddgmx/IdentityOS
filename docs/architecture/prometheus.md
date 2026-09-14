@@ -1,6 +1,6 @@
 # Prometheus: Autonomous Capability Evolution
 
-**Design Document — v1**
+**Design Document — v2**
 
 ---
 
@@ -13,9 +13,9 @@ calculate a complex expression, read a file.
 Without Prometheus, the system can only say "I can't do that." The user is stuck. The
 system cannot grow.
 
-Prometheus closes this gap. It detects when a missing capability is needed, finds a
-trustworthy version, installs it safely, retries the original task, and remembers what
-it learned so the next request is faster.
+Prometheus closes this gap. It detects when a missing capability is needed and delegates
+a durable acquisition to Executive. Executive establishes the real lifecycle outcome;
+Prometheus then reconciles that evidence into learning so the next request is faster.
 
 ---
 
@@ -23,10 +23,9 @@ it learned so the next request is faster.
 
 ### Autonomous evolution
 
-The system should acquire new capabilities on its own, without requiring code deploys,
-Docker rebuilds, or human intervention. The user asks for something. If a capability
-exists in the registry that can fulfill the request, Prometheus finds it, installs it,
-and the user gets their answer — all in one interaction.
+The system should acquire new capabilities without tying correctness to one model
+response remaining active. The user asks for something, Prometheus detects the gap,
+and Executive persists and executes the work independently of the interactive response.
 
 ### Safe evolution
 
@@ -60,8 +59,9 @@ Prometheus does **not**:
 - **Answer user questions.** That is the LLM adapter's job. Prometheus only detects
   gaps and installs missing capabilities. It never generates responses.
 
-- **Execute capabilities.** Installed capabilities are invoked by the SkillRouter and
-  Planner layers. Prometheus only handles the acquisition lifecycle.
+- **Execute capabilities.** Executive invokes only a capability-declared safe probe
+  through the normal permission gateway. User-requested use remains owned by runtime
+  routing and installed capabilities.
 
 - **Own memories.** Memory and fact stores are managed by the Identity Runtime.
   Prometheus has its own learning store (success rates, task→capability mappings,
@@ -81,6 +81,35 @@ Prometheus does **not**:
 ---
 
 ## Architecture
+
+Developer setup, API return fields, authorization recovery, and troubleshooting
+are documented in [Durable Capability Acquisition](../acquisition_lifecycle.md).
+
+When a runtime has Executive attached, this is the authoritative path:
+
+```text
+Prometheus detects need
+  -> Executive creates/idempotently reuses a durable task
+  -> registry search
+  -> trust + dependency checks (marketplace candidates)
+  -> generate (only when absent)
+  -> validate -> publish (generated candidates)
+  -> install -> activate
+  -> invoke declared safe probe through CapabilityRegistry.call
+  -> inspect persisted installation
+  -> construct a fresh CapabilityRegistry -> reload -> reuse probe
+  -> terminal Executive evidence
+  -> Prometheus exactly-once reconciliation into learning + history
+```
+
+Sensitive probes do not receive implicit permission. The task becomes `BLOCKED` with
+`authorization_required`, remains ineligible for scheduler execution, and may be resumed
+after an explicit grant. If a newly installed capability exhausts verification retries,
+Executive rolls it back and records the compensation result. A capability installed
+before the task is never removed by that rollback.
+
+The inline diagram below documents the compatibility path used only when no Executive
+is attached:
 
 ```
 User says: "Check my latest PR on GitHub"
@@ -163,9 +192,8 @@ The Prometheus engine hooks into `runtime/orchestrator.py` at two points in the
 **Pre-check (Stage 2b) — before context composition**
 
 Runs after input sanitization but before the system composes the context that is
-sent to the LLM. If Prometheus detects a missing capability and installs it here,
-the context composition picks up the new capability's prompts and skills. The LLM
-sees the capability from the very first adapter call.
+sent to the LLM. Prometheus first reconciles terminal Executive work, then detects
+new gaps. A new acquisition is queued durably and does not block ordinary chat.
 
 ```
 Input → Sanitize → [Pre-check] → Compose Context → Route → Adapter → Output
@@ -174,15 +202,14 @@ Input → Sanitize → [Pre-check] → Compose Context → Route → Adapter →
 **Post-check (Stage 4b) — after adapter response**
 
 Runs after the LLM adapter responds. If the response contains patterns like "I don't
-have a GitHub capability," Prometheus installs the missing capability and retries the
-adapter call with the updated context. The user sees the retry response, not the
-original refusal.
+have a GitHub capability," Prometheus may queue the same durable acquisition path.
+The legacy inline fallback can still install and retry when no Executive is attached.
 
 ```
 Input → ... → Adapter → [Post-check → Install → Retry] → Output
 ```
 
-### Safety mechanisms during retry
+### Safety mechanisms during legacy inline retry
 
 When Prometheus retries the original task by calling `runtime.process()`, the re-entrancy
 guard (`_evolving` flag) prevents the recursive evolution that would otherwise occur:
@@ -213,6 +240,11 @@ Legacy evidence stored as a top-level JSON list remains readable. New writes
 use an `entries` object and retain the latest 200 records. Persistence failures
 are logged with their exception instead of being silently discarded; they do
 not turn a failed persistence operation into successful evidence.
+
+Delegated records carry `source_task_id`. Both learning and evidence writers reject
+duplicates for that stable ID, so reconciliation is retry-safe even if a process stops
+after one namespace was written but before the other. A queued, running, or blocked
+task is never reconciled as success.
 
 ### Registry unavailable
 
@@ -369,8 +401,9 @@ policies. Extending it to capability acquisition is a natural evolution.
 
 | File | Role |
 |------|------|
-| `core/prometheus/engine.py` | Public API — `detect_need()`, `evolve()`, `pre/post_check_and_evolve()`, `can_fulfill()`, `history()`, safety guard |
-| `core/prometheus/pipeline.py` | Acquisition lifecycle — runs stages in order, manages `AcquisitionRecord`, rate limiting |
+| `core/prometheus/engine.py` | Public API, Executive attachment, and reconciliation entry points |
+| `core/prometheus/pipeline.py` | Need handling, durable Executive delegation, and legacy inline lifecycle |
+| `core/prometheus/executive_reconciler.py` | Convert terminal Executive runtime evidence into exactly-once Prometheus records |
 | `core/prometheus/models.py` | Data models — `CapabilityNeed`, `RegistryCandidate`, `AcquisitionRecord`, `EvolutionResult`, `PrometheusConfig`, enums |
 | `core/prometheus/stages/need_detector.py` | Keyword matching and response pattern analysis |
 | `core/prometheus/stages/registry_searcher.py` | Load registry index, score relevance, build candidates |
@@ -383,6 +416,8 @@ policies. Extending it to capability acquisition is a natural evolution.
 | `core/prometheus/stages/performance_evaluator.py` | Compare original vs retry response quality |
 | `core/prometheus/stages/learner.py` | Persist success rates and task→capability mappings |
 | `core/prometheus/stages/evidence_recorder.py` | Persist acquisition evidence history |
+| `core/executive/workflow.py` | Generic durable acquisition plan |
+| `core/executive/executor.py` | Trust, install, activation, gateway probe, persistence, reload, reuse, and rollback evidence |
 | `runtime/orchestrator.py` | Integration hooks (Stage 2b and 4b) |
 | `identitybench/metrics/evolution.py` | 8 Evolution metrics for IdentityBench |
 | `identitybench/worlds/evolution.py` | Evolution benchmark world (10 interactions, 21 days) |

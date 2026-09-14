@@ -5,11 +5,10 @@ The executive's default plan for acquiring any capability:
 
     Need Detection
         -> Task Creation
-        -> Registry Search
-        -> Install if exists
+        -> Registry Search -> Trust + Dependency Checks (if found)
         -> Else Design -> Generate -> Validate -> Publish
-        -> Install
-        -> Verify
+        -> Install -> Activate -> Invoke
+        -> Persist -> Reload -> Reuse
         -> Retry Original Goal
 
 No code here knows about individual capability names.  The target capability
@@ -133,6 +132,20 @@ def build_acquisition_plan(capability_id: str, original_request: Optional[str] =
             "params": {"capability": capability_id},
         },
         {
+            "action": "trust",
+            "description": f"Verifying trust for {capability_id}",
+            "params": {"capability": capability_id},
+            "run_if_step": "registry_search",
+            "run_if_key": "found",
+        },
+        {
+            "action": "dependencies",
+            "description": f"Checking dependencies for {capability_id}",
+            "params": {"capability": capability_id},
+            "run_if_step": "registry_search",
+            "run_if_key": "found",
+        },
+        {
             "action": "generate",
             "description": f"Generating {capability_id} capability",
             "params": {"capability": capability_id},
@@ -143,8 +156,6 @@ def build_acquisition_plan(capability_id: str, original_request: Optional[str] =
             "action": "validate",
             "description": f"Validating {capability_id} capability",
             "params": {"capability": capability_id},
-            "run_unless_step": "registry_search",
-            "run_unless_key": "found",
         },
         {
             "action": "publish",
@@ -159,8 +170,28 @@ def build_acquisition_plan(capability_id: str, original_request: Optional[str] =
             "params": {"capability": capability_id},
         },
         {
-            "action": "verify",
-            "description": f"Verifying {capability_id}",
+            "action": "activate",
+            "description": f"Activating {capability_id}",
+            "params": {"capability": capability_id},
+        },
+        {
+            "action": "invoke",
+            "description": f"Invoking a safe probe for {capability_id}",
+            "params": {"capability": capability_id},
+        },
+        {
+            "action": "persist",
+            "description": f"Verifying persisted state for {capability_id}",
+            "params": {"capability": capability_id},
+        },
+        {
+            "action": "reload",
+            "description": f"Reloading {capability_id} from persisted state",
+            "params": {"capability": capability_id},
+        },
+        {
+            "action": "reuse",
+            "description": f"Reusing {capability_id} after reload",
             "params": {"capability": capability_id},
         },
     ]

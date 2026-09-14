@@ -290,56 +290,29 @@ class EvolutionPipeline:
                 ),
             )
 
-        # Idempotency: don't re-queue a task that is already active.
-        for t in executive.active_tasks(identity_id):
-            if t.capability_id == cap_id:
-                return EvolutionResult(
-                    success=False,
-                    acquired=False,
-                    acquisition_record=AcquisitionRecord(
-                        need=need,
-                        identity_id=identity_id,
-                        mode=AcquisitionMode.AUTOMATIC,
-                        status=AcquisitionStatus.SEARCHING,
-                        error=f"Acquisition of '{cap_id}' already active (task {t.task_id}).",
-                    ),
-                )
-
-        # Don't re-queue a capability that already reached a terminal state.
-        from core.executive.models import TaskStatus
-        for t in executive.store.load_terminal(identity_id):
-            if t.capability_id == cap_id and t.status == TaskStatus.COMPLETED:
-                return EvolutionResult(
-                    success=False,
-                    acquired=False,
-                    acquisition_record=AcquisitionRecord(
-                        need=need,
-                        identity_id=identity_id,
-                        mode=AcquisitionMode.AUTOMATIC,
-                        status=AcquisitionStatus.SEARCHING,
-                        error=f"Acquisition of '{cap_id}' already completed (task {t.task_id}).",
-                    ),
-                )
-
         goal = need.original_request or f"Acquire the {cap_id} capability"
-        task = executive.create_acquisition_task(
+        task, created = executive.request_acquisition(
             identity_id=identity_id,
             capability_id=cap_id,
             goal=goal,
             original_request=need.original_request or goal,
+            runtime=runtime,
         )
-        if executive.scheduler:
-            executive.scheduler.start()
 
         record = AcquisitionRecord(
             need=need,
             identity_id=identity_id,
             mode=AcquisitionMode.AUTOMATIC,
             status=AcquisitionStatus.SEARCHING,
-            error=None,
+            source_task_id=task.task_id,
+            error=(
+                None
+                if created
+                else f"Acquisition of '{cap_id}' already {task.status.value} (task {task.task_id})."
+            ),
         )
         return EvolutionResult(
-            success=True,
+            success=created,
             acquired=False,  # the executive owns execution now
             acquisition_record=record,
             duration_ms=0.0,

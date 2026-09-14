@@ -198,6 +198,33 @@ def test_registry_manager_falls_back_to_legacy_root_index(tmp_path):
     assert listed.data["capabilities"][0]["id"] == "legacy_demo"
 
 
+def test_registry_manager_loads_version_1_state_with_compatible_skills(tmp_path):
+    storage = JSONFileBackend(root_dir=str(tmp_path / "store"))
+    identity_id = "registry-manager-v1-upgrade"
+    storage.save(
+        identity_id,
+        CapabilityRegistry.CAP_NAMESPACE,
+        {
+            "installed": [
+                {"id": "registry_manager", "version": "1.0.0", "config": {}}
+            ]
+        },
+    )
+
+    registry = CapabilityRegistry(storage)
+    manager = registry.get(identity_id, "registry_manager")
+
+    assert manager is not None
+    assert manager.version == "1.1.0"
+    assert {skill.name for skill in manager.skills()} == {
+        "registry_manager.list_capabilities",
+        "registry_manager.publish_capability",
+        "registry_manager.install_capability",
+    }
+    result = registry.call(identity_id, "registry_manager.list_capabilities")
+    assert result.success is True
+
+
 def test_every_local_marketplace_skill_executes_through_gateway(tmp_path):
     store_path = tmp_path / "store"
     workspace = tmp_path / "workspace"

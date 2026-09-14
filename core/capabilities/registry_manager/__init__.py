@@ -17,7 +17,7 @@ _PUBLISH_LOCK = threading.Lock()
 class RegistryManagerCapability(Capability):
     id = "registry_manager"
     name = "Registry Manager"
-    version = "1.0.0"
+    version = "1.1.0"
     author = "IdentityOS"
     license = "MIT"
     homepage = "https://github.com/lacebx/IdentityOS"
@@ -26,8 +26,12 @@ class RegistryManagerCapability(Capability):
 
     def __init__(self, config: Optional[dict] = None) -> None:
         super().__init__(config)
+        self._identity_id: Optional[str] = None
+        self._storage: Any = None
 
     def install(self, identity_id: str, storage: Any) -> None:
+        self._identity_id = identity_id
+        self._storage = storage
         storage.save(identity_id, "capability.registry_manager", {"installed_at": None})
 
     def uninstall(self, identity_id: str, storage: Any) -> None:
@@ -209,11 +213,45 @@ class RegistryManagerCapability(Capability):
         match = next((c for c in caps if c.get("id") == cap_id), None)
         if not match:
             return {"error": f"Capability '{cap_id}' not found in registry"}
-        return {
+        resolved = {
             "cap_id": match["id"],
             "name": match.get("name", cap_id),
             "version": match.get("version", "?"),
-            "status": "ready_to_install",
             "description": match.get("description", ""),
-            "message": f"To install: runtime.capability_registry.install('<identity_id>', '{cap_id}')",
+        }
+        if self._storage is None or not self._identity_id:
+            return {
+                **resolved,
+                "status": "ready_to_install",
+                "message": "Resolved capability; no durable Executive is bound.",
+            }
+
+        from core.acquisition import get_acquisition_provider
+
+        provider = get_acquisition_provider(self._storage)
+        if provider is None:
+            return {
+                **resolved,
+                "status": "ready_to_install",
+                "message": "Resolved capability; no durable Executive is registered.",
+            }
+
+        goal = f"Install and verify the {match['id']} capability"
+        task, created = provider.request_acquisition(
+            identity_id=self._identity_id,
+            capability_id=match["id"],
+            goal=goal,
+            original_request=goal,
+        )
+        return {
+            **resolved,
+            "status": task.status.value,
+            "task_id": task.task_id,
+            "created": created,
+            "stages": [step.action for step in task.steps],
+            "message": (
+                "Durable acquisition queued."
+                if created
+                else "Using the existing durable acquisition state."
+            ),
         }
