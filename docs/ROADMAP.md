@@ -15,7 +15,7 @@ runtime-observed behavior and regression tests.
 | North Star property | Current runtime evidence | Remaining gap |
 |---|---|---|
 | Persistent identities | JSON and SQLite backends, snapshots, migrations, restart tests | Crash-safe background state commits and broader migration fixtures |
-| Portable capabilities | Installable capability registry, typed skill contracts, centralized invocation gateway | Full generate-to-reuse conformance suite for arbitrary third-party packs |
+| Portable capabilities | Durable generate-to-reuse workflow, typed skill contracts, centralized invocation gateway, restart/reuse tests | Package-level conformance for arbitrary third-party packs |
 | Truthful execution | Structured capability results, evidence footers, failure diagnostics, hermetic validation gates | Standard evidence receipts across every adapter and external integration |
 | Durable long-running tasks | Persisted Executive tasks, checkpoints, recovery, retry policy, reconciliation for uncertain side effects | Provider-level idempotency keys and automated reconciliation where external APIs support them |
 | Evidence-backed memory | User-scoped profiles/memories, contradiction evidence, restart recall, generic holdout extraction | Retention policy, provenance queries, and multi-process conflict resolution |
@@ -50,7 +50,7 @@ maintenance work.
 - Add crash/restart tests at every journal transition.
 - Establish latency budgets for policy, context, model, tool, and state-commit stages.
 
-## Milestone 3: Capability Lifecycle Conformance — Next
+## Milestone 3: Capability Lifecycle Conformance — Active
 
 **Goal:** demonstrate the complete lifecycle for arbitrary capability packs.
 
@@ -60,6 +60,9 @@ generate -> validate -> publish -> install -> activate -> invoke
 ```
 
 - Publish a capability conformance harness with representative success and failure fixtures.
+- Durable built-in lifecycle now covers trust, dependencies, generation, validation,
+  publication, installation, permission-gated activation, safe invocation, persistence,
+  fresh-registry reload, reuse, rollback, and exactly-once Prometheus learning.
 - Require declared permissions, input schemas, effect classification, and replay policy.
 - Add signed package metadata and dependency verification.
 - Record durable invocation receipts that can be queried by task and identity.

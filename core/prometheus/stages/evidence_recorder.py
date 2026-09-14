@@ -10,11 +10,11 @@ def record_evidence(
     identity_id: str,
     record: AcquisitionRecord,
     storage,
-) -> None:
+) -> bool:
     load = getattr(storage, "load", None)
     save = getattr(storage, "save", None)
     if not callable(load) or not callable(save):
-        return
+        return False
 
     persisted = load(identity_id, _EVIDENCE_NAMESPACE)
     if isinstance(persisted, list):
@@ -24,6 +24,12 @@ def record_evidence(
         evidence = persisted["entries"]
     else:
         evidence = []
+
+    if record.source_task_id and any(
+        item.get("source_task_id") == record.source_task_id
+        for item in evidence
+    ):
+        return False
 
     entry = {
         "timestamp": record.timestamp,
@@ -42,10 +48,12 @@ def record_evidence(
         "status": record.status.value,
         "mode": record.mode.value,
         "error": record.error,
+        "source_task_id": record.source_task_id,
     }
     evidence.append(entry)
     evidence = evidence[-200:]
     save(identity_id, _EVIDENCE_NAMESPACE, {"entries": evidence})
+    return True
 
 
 def get_evidence_history(identity_id: str, storage) -> list:

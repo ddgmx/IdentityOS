@@ -281,6 +281,8 @@ class IdentityRuntime:
                     capability_registry=self.capability_registry,
                 )
                 register_executive(self.executive)
+                if self.prometheus is not None:
+                    self.prometheus.attach_executive(self.executive)
             except Exception:
                 self.executive = None
 
@@ -888,6 +890,7 @@ class IdentityRuntime:
         stage_started = trace.start_stage()
         if self.prometheus:
             try:
+                self.prometheus.reconcile_executive(identity.id)
                 self.prometheus.begin_interaction(request.id)
                 _pre = self.prometheus.pre_check_and_evolve(
                     user_input=sanitized_input, identity_id=identity.id,

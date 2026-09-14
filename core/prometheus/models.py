@@ -96,6 +96,9 @@ class AcquisitionRecord:
     )
     identity_id: str = ""
     mode: AcquisitionMode = AcquisitionMode.AUTOMATIC
+    # Stable provenance for exactly-once reconciliation of durable Executive
+    # tasks. Older inline Prometheus records leave this unset.
+    source_task_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +116,7 @@ class AcquisitionRecord:
             "timestamp": self.timestamp,
             "identity_id": self.identity_id,
             "mode": self.mode.value,
+            "source_task_id": self.source_task_id,
         }
 
 

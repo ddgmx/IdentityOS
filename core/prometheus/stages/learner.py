@@ -41,10 +41,15 @@ def record_acquisition(
     identity_id: str,
     record: AcquisitionRecord,
     storage,
-) -> None:
+) -> bool:
     if not storage:
-        return
+        return False
     data = _load_learning_data(identity_id, storage)
+    if record.source_task_id and any(
+        item.get("source_task_id") == record.source_task_id
+        for item in data["acquisitions"]
+    ):
+        return False
     data["acquisitions"].append(record.to_dict())
     data["acquisitions"] = data["acquisitions"][-100:]
 
@@ -65,6 +70,7 @@ def record_acquisition(
         tc[cap_id] = tc.get(cap_id, 0) + 1
 
     _save_learning_data(identity_id, storage, data)
+    return True
 
 
 def get_success_rate(identity_id: str, cap_id: str, storage) -> float:

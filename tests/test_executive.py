@@ -424,6 +424,16 @@ def test_registry_manager_queues_and_completes_durable_lifecycle(engine):
     assert registry.get("manager-test", "calc") is not None
     assert any(e.label == "capability_reused" and e.success for e in final.evidence)
 
+    repeated = registry.call(
+        "manager-test",
+        "registry_manager.install_capability",
+        cap_id="calc",
+    )
+    assert repeated.success is True
+    assert repeated.data["created"] is False
+    assert repeated.data["status"] == "completed"
+    assert repeated.data["task_id"] == result.data["task_id"]
+
 
 def test_lifecycle_survives_restart_between_persist_and_reload(storage):
     from core.capabilities.registry import CapabilityRegistry
@@ -716,7 +726,7 @@ def test_status_questions_are_not_acquisition_goals():
 
 def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
     """Prometheus delegation must not re-commit on questions, and must not
-    re-queue a capability that already completed."""
+    duplicate active work. Stale completion claims are re-verified."""
     from core.executive.workflow import build_acquisition_plan
     from core.prometheus.models import CapabilityNeed, EvolutionResult
     from core.prometheus.pipeline import EvolutionPipeline
@@ -761,10 +771,11 @@ def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
         make_need("exec_test_q", "create a exec_test_q capability and install it"),
         "tester", rt, storage, None,
     )
-    assert not res.acquired and "already active" in (res.acquisition_record.error or "")
+    assert not res.acquired and "already queued" in (res.acquisition_record.error or "")
 
-    # 4) A completed capability must not be re-queued.  Finish the step-2
-    #    task (running -> completed) so only the terminal check applies.
+    # 4) A completed task with no installed capability is not runtime proof.
+    #    Finish the step-2 task without installing anything, then confirm a
+    #    fresh acquisition is queued to establish reality.
     from core.executive.models import TaskStatus
     from core.executive.state import can_transition, transition as _transition
     _active = rt.executive.active_tasks("tester")[0]
@@ -785,7 +796,9 @@ def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
         make_need("exec_test_q", "create a exec_test_q capability and install it"),
         "tester", rt, storage, None,
     )
-    assert not res.acquired and "already completed" in (res.acquisition_record.error or "")
+    assert res.success is True
+    assert res.acquisition_record.error is None
+    assert len(rt.executive.active_tasks("tester")) == 1
 
 
 def test_registry_reload_binds_storage(tmp_path):

@@ -47,6 +47,13 @@ def get_executive_for(storage: Any) -> Optional["ExecutiveRuntime"]:
     return _ACTIVE_EXECUTIVES.get(id(storage))
 
 
+def unregister_executive(executive: "ExecutiveRuntime") -> None:
+    """Remove only the exact engine registered for its storage object."""
+    key = id(executive.storage)
+    if _ACTIVE_EXECUTIVES.get(key) is executive:
+        _ACTIVE_EXECUTIVES.pop(key, None)
+
+
 class ExecutiveRuntime:
     def __init__(
         self,
@@ -667,3 +674,4 @@ class ExecutiveRuntime:
 
     def shutdown(self) -> None:
         self.scheduler.stop()
+        unregister_executive(self)
