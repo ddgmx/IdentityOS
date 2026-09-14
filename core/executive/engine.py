@@ -34,31 +34,21 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-# ── Active executive registry (one engine per storage backend) ───────────
-# Mirrors the existing module-level registry pattern (core/capabilities/registry).
-_ACTIVE_EXECUTIVES: dict[int, "ExecutiveRuntime"] = {}
-
-
 def register_executive(executive: "ExecutiveRuntime") -> None:
-    _ACTIVE_EXECUTIVES[id(executive.storage)] = executive
     from core.acquisition import register_acquisition_provider
 
     register_acquisition_provider(executive.storage, executive)
 
 
 def get_executive_for(storage: Any) -> Optional["ExecutiveRuntime"]:
-    executive = _ACTIVE_EXECUTIVES.get(id(storage))
-    if executive is not None and executive.storage is not storage:
-        _ACTIVE_EXECUTIVES.pop(id(storage), None)
-        return None
-    return executive
+    from core.acquisition import get_acquisition_provider
+
+    provider = get_acquisition_provider(storage)
+    return provider if isinstance(provider, ExecutiveRuntime) else None
 
 
 def unregister_executive(executive: "ExecutiveRuntime") -> None:
     """Remove only the exact engine registered for its storage object."""
-    key = id(executive.storage)
-    if _ACTIVE_EXECUTIVES.get(key) is executive:
-        _ACTIVE_EXECUTIVES.pop(key, None)
     from core.acquisition import unregister_acquisition_provider
 
     unregister_acquisition_provider(executive.storage, executive)

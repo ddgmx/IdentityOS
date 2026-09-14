@@ -25,7 +25,10 @@ registry.grant(identity_id, "registry_manager", "capability:manage")
 ```
 
 The binding compares the actual storage object, not only its Python object ID.
-`executive.shutdown()` unregisters only that exact provider instance.
+`executive.shutdown()` unregisters only that exact provider instance. Prefer
+`runtime.shutdown()` when using `IdentityRuntime` so runtime-owned services are
+released through one lifecycle API and do not remain in the active-provider
+registry.
 
 ## Request and status contract
 

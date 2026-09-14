@@ -368,6 +368,11 @@ class IdentityRuntime:
                 count += 1
         return count
 
+    def shutdown(self) -> None:
+        """Release runtime-owned background services and global bindings."""
+        if self.executive is not None:
+            self.executive.shutdown()
+
     def _load_persisted_memories(self, identity_id: str) -> int:
         if not self._storage:
             return 0

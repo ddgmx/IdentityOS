@@ -8,6 +8,7 @@ object so a recycled ``id(storage)`` can never resolve an unrelated provider.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any, Protocol
 
 
@@ -30,34 +31,66 @@ class _ProviderBinding:
     provider: AcquisitionProvider
 
 
-_PROVIDERS: dict[int, _ProviderBinding] = {}
+class AcquisitionProviderRegistry:
+    """Thread-safe, identity-based registry for acquisition providers.
+
+    Bindings are strongly held to preserve the existing active-Executive
+    contract. Runtime owners must call ``shutdown``; exact-instance removal and
+    referent checks prevent one runtime or a recycled object ID from affecting
+    another binding.
+    """
+
+    def __init__(self) -> None:
+        self._bindings: dict[int, _ProviderBinding] = {}
+        self._lock = RLock()
+
+    def register(self, storage: Any, provider: AcquisitionProvider) -> None:
+        key = id(storage)
+        with self._lock:
+            self._bindings[key] = _ProviderBinding(
+                storage=storage,
+                provider=provider,
+            )
+
+    def get(self, storage: Any) -> AcquisitionProvider | None:
+        key = id(storage)
+        with self._lock:
+            binding = self._bindings.get(key)
+            if binding is None:
+                return None
+            if binding.storage is not storage:
+                self._bindings.pop(key, None)
+                return None
+            return binding.provider
+
+    def unregister(self, storage: Any, provider: AcquisitionProvider) -> None:
+        key = id(storage)
+        with self._lock:
+            binding = self._bindings.get(key)
+            if (
+                binding is not None
+                and binding.storage is storage
+                and binding.provider is provider
+            ):
+                self._bindings.pop(key, None)
+
+
+_PROVIDERS = AcquisitionProviderRegistry()
 
 
 def register_acquisition_provider(
     storage: Any,
     provider: AcquisitionProvider,
 ) -> None:
-    _PROVIDERS[id(storage)] = _ProviderBinding(storage=storage, provider=provider)
+    _PROVIDERS.register(storage, provider)
 
 
 def get_acquisition_provider(storage: Any) -> AcquisitionProvider | None:
-    binding = _PROVIDERS.get(id(storage))
-    if binding is None:
-        return None
-    if binding.storage is not storage:
-        _PROVIDERS.pop(id(storage), None)
-        return None
-    return binding.provider
+    return _PROVIDERS.get(storage)
 
 
 def unregister_acquisition_provider(
     storage: Any,
     provider: AcquisitionProvider,
 ) -> None:
-    binding = _PROVIDERS.get(id(storage))
-    if (
-        binding is not None
-        and binding.storage is storage
-        and binding.provider is provider
-    ):
-        _PROVIDERS.pop(id(storage), None)
+    _PROVIDERS.unregister(storage, provider)
