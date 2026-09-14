@@ -16,7 +16,12 @@ import uuid
 from typing import Any, Optional
 
 from core.executive import workflow
-from core.executive.executor import ExecutionContext, execute_step, replay_policy_for_action
+from core.executive.executor import (
+    ExecutionContext,
+    execute_step,
+    replay_policy_for_action,
+    rollback_acquisition,
+)
 from core.executive.models import Evidence, Task, TaskStatus, TaskStep, TaskStepStatus
 from core.executive.progress import compute_progress, render_progress_block
 from core.executive.recovery import recover_tasks
@@ -101,12 +106,64 @@ class ExecutiveRuntime:
             original_request=original_request,
         )
         task.steps = [self._coerce_step(s) for s in (steps or self._plan_for(goal, capability_id))]
+        if runtime is not None:
+            self._ctx(identity_id, runtime=runtime)
         self.store.save(task)
         if autostart is None:
             autostart = self._autostart
         if autostart:
             self.scheduler.start()
         return task
+
+    def request_acquisition(
+        self,
+        identity_id: str,
+        capability_id: str,
+        goal: str,
+        *,
+        original_request: Optional[str] = None,
+        priority: int = 0,
+        runtime: Any = None,
+    ) -> tuple[Task, bool]:
+        """Idempotently request a durable capability acquisition.
+
+        A historical ``COMPLETED`` task is only reused when runtime state still
+        proves that the capability is installed. This prevents a stale task
+        claim from replacing current installation evidence.
+        """
+        for task in self.active_tasks(identity_id):
+            if task.capability_id == capability_id:
+                if runtime is not None:
+                    self._ctx(identity_id, runtime=runtime)
+                return task, False
+
+        installed = False
+        if self.capability_registry is not None:
+            try:
+                installed = self.capability_registry.get(identity_id, capability_id) is not None
+            except Exception:
+                installed = False
+        if installed:
+            completed = [
+                task
+                for task in self.store.load_terminal(identity_id)
+                if task.capability_id == capability_id
+                and task.status == TaskStatus.COMPLETED
+            ]
+            if completed:
+                completed.sort(key=lambda task: task.last_updated, reverse=True)
+                return completed[0], False
+
+        task = self.create_acquisition_task(
+            identity_id=identity_id,
+            capability_id=capability_id,
+            goal=goal,
+            original_request=original_request,
+            priority=priority,
+            runtime=runtime,
+        )
+        self.scheduler.start()
+        return task, True
 
     def create_acquisition_task(
         self,
@@ -205,21 +262,47 @@ class ExecutiveRuntime:
         if task.status in (TaskStatus.RUNNING, TaskStatus.QUEUED):
             pass
         elif task.status == TaskStatus.BLOCKED:
-            if any(s.status == TaskStepStatus.BLOCKED for s in task.steps):
+            blocked_steps = [
+                step for step in task.steps
+                if step.status == TaskStepStatus.BLOCKED
+            ]
+            if any(
+                step.result.get("block_type") != "authorization_required"
+                for step in blocked_steps
+            ):
                 raise IllegalTransition(
                     "Task has an interrupted step with an unknown outcome; use "
                     "resolve_interrupted_step before resuming"
                 )
+            for step in blocked_steps:
+                step.status = TaskStepStatus.PENDING
+                step.error = None
             transition(task, TaskStatus.RUNNING)
+            task.error = None
         elif task.status == TaskStatus.FAILED:
             if not force:
                 raise IllegalTransition(
                     f"Cannot resume failed task {task_id} without force=True"
                 )
             task.retry_count = 0
+            install_step = task.step_by_id("install")
+            rolled_back = bool(
+                install_step is not None
+                and install_step.result.get("rolled_back")
+            )
+            reset_after_install = False
             for s in task.steps:
-                if s.status in (TaskStepStatus.FAILED, TaskStepStatus.PENDING):
+                if s is install_step and rolled_back:
+                    reset_after_install = True
+                if (
+                    s.status in (TaskStepStatus.FAILED, TaskStepStatus.PENDING)
+                    or reset_after_install
+                ):
                     s.status = TaskStepStatus.PENDING
+                    s.retry_count = 0
+                    s.error = None
+                    if s is install_step:
+                        s.result = {}
             transition(task, TaskStatus.RUNNING)
         else:
             raise IllegalTransition(f"Cannot resume task {task_id} in state {task.status.value}")
@@ -346,7 +429,13 @@ class ExecutiveRuntime:
         Order: RUNNING tasks (priority desc, then oldest), then QUEUED tasks.
         Returns a summary dict for observability.
         """
-        summary = {"advanced": 0, "completed": [], "failed": [], "tasks_processed": 0}
+        summary = {
+            "advanced": 0,
+            "completed": [],
+            "failed": [],
+            "blocked": [],
+            "tasks_processed": 0,
+        }
         with self._exec_lock:
             identities = [identity_id] if identity_id else self._all_identities_with_tasks()
             for ident in identities:
@@ -359,6 +448,8 @@ class ExecutiveRuntime:
                         summary["completed"].append(task.task_id)
                     elif task.status == TaskStatus.FAILED:
                         summary["failed"].append(task.task_id)
+                    elif task.status == TaskStatus.BLOCKED:
+                        summary["blocked"].append(task.task_id)
         return summary
 
     def _all_identities_with_tasks(self) -> list[str]:
@@ -374,7 +465,10 @@ class ExecutiveRuntime:
             return []
 
     def _ready_tasks(self, identity_id: str) -> list[Task]:
-        tasks = self.store.load_active(identity_id)
+        tasks = [
+            task for task in self.store.load_active(identity_id)
+            if task.status in (TaskStatus.QUEUED, TaskStatus.RUNNING)
+        ]
         tasks.sort(key=lambda t: (0 if t.status == TaskStatus.RUNNING else 1, -t.priority, t.created_at))
         return tasks
 
@@ -427,6 +521,24 @@ class ExecutiveRuntime:
                 next_step.status = TaskStepStatus.COMPLETED
                 next_step.error = None
             else:
+                if result.get("blocked"):
+                    reason = str(result.get("reason") or f"Step '{next_step.action}' is blocked")
+                    attempt["status"] = "blocked"
+                    attempt["finished_at"] = _now()
+                    attempt["evidence_count"] = len(evidence)
+                    next_step.status = TaskStepStatus.BLOCKED
+                    next_step.error = reason
+                    task.error = reason
+                    task.current_step = next_step.description
+                    task.last_updated = _now()
+                    task.checkpoint = {
+                        "blocked_step": next_step.action,
+                        "block_type": result.get("block_type", "unspecified"),
+                        "saved_at": _now(),
+                    }
+                    transition(task, TaskStatus.BLOCKED)
+                    self.store.save(task)
+                    return steps_run + 1
                 attempt["status"] = "failed"
                 next_step.retry_count += 1
                 task.retry_count += 1
@@ -436,6 +548,9 @@ class ExecutiveRuntime:
                 else:
                     next_step.status = TaskStepStatus.FAILED
                     task.error = f"Step '{next_step.action}' failed after {next_step.retry_count} retries"
+                    rollback_evidence = rollback_acquisition(task, ctx)
+                    next_step.evidence.extend(rollback_evidence)
+                    task.evidence.extend(rollback_evidence)
                     transition(task, TaskStatus.FAILED)
                     attempt["finished_at"] = _now()
                     attempt["evidence_count"] = len(evidence)
@@ -467,6 +582,7 @@ class ExecutiveRuntime:
                     "outcome": "completed",
                     "steps": len(task.steps),
                     "evidence": len(task.evidence),
+                    "capability_id": task.capability_id,
                 }
             task.last_updated = _now()
             self.store.save(task)
