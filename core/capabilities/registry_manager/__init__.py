@@ -226,10 +226,10 @@ class RegistryManagerCapability(Capability):
                 "message": "Resolved capability; no durable Executive is bound.",
             }
 
-        from core.executive.engine import get_executive_for
+        from core.acquisition import get_acquisition_provider
 
-        executive = get_executive_for(self._storage)
-        if executive is None:
+        provider = get_acquisition_provider(self._storage)
+        if provider is None:
             return {
                 **resolved,
                 "status": "ready_to_install",
@@ -237,7 +237,7 @@ class RegistryManagerCapability(Capability):
             }
 
         goal = f"Install and verify the {match['id']} capability"
-        task, created = executive.request_acquisition(
+        task, created = provider.request_acquisition(
             identity_id=self._identity_id,
             capability_id=match["id"],
             goal=goal,

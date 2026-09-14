@@ -41,10 +41,17 @@ _ACTIVE_EXECUTIVES: dict[int, "ExecutiveRuntime"] = {}
 
 def register_executive(executive: "ExecutiveRuntime") -> None:
     _ACTIVE_EXECUTIVES[id(executive.storage)] = executive
+    from core.acquisition import register_acquisition_provider
+
+    register_acquisition_provider(executive.storage, executive)
 
 
 def get_executive_for(storage: Any) -> Optional["ExecutiveRuntime"]:
-    return _ACTIVE_EXECUTIVES.get(id(storage))
+    executive = _ACTIVE_EXECUTIVES.get(id(storage))
+    if executive is not None and executive.storage is not storage:
+        _ACTIVE_EXECUTIVES.pop(id(storage), None)
+        return None
+    return executive
 
 
 def unregister_executive(executive: "ExecutiveRuntime") -> None:
@@ -52,6 +59,9 @@ def unregister_executive(executive: "ExecutiveRuntime") -> None:
     key = id(executive.storage)
     if _ACTIVE_EXECUTIVES.get(key) is executive:
         _ACTIVE_EXECUTIVES.pop(key, None)
+    from core.acquisition import unregister_acquisition_provider
+
+    unregister_acquisition_provider(executive.storage, executive)
 
 
 class ExecutiveRuntime:

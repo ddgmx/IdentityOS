@@ -82,6 +82,9 @@ Prometheus does **not**:
 
 ## Architecture
 
+Developer setup, API return fields, authorization recovery, and troubleshooting
+are documented in [Durable Capability Acquisition](../acquisition_lifecycle.md).
+
 When a runtime has Executive attached, this is the authoritative path:
 
 ```text
