@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from core.acquisition import AcquisitionProviderRegistry
 from runtime.persistence import InMemoryBackend
 
@@ -43,3 +45,22 @@ def test_registry_rejects_stale_binding_when_object_id_is_reused():
     assert registry.get(current_storage) is None
     assert id(current_storage) not in registry._bindings
 
+
+def test_registry_operations_are_safe_under_concurrent_access():
+    registry = AcquisitionProviderRegistry()
+    storages = [InMemoryBackend() for _ in range(8)]
+    providers = [_Provider() for _ in storages]
+
+    def exercise(index: int) -> None:
+        storage = storages[index]
+        provider = providers[index]
+        for _ in range(250):
+            registry.register(storage, provider)
+            assert registry.get(storage) is provider
+            registry.unregister(storage, provider)
+            assert registry.get(storage) is None
+
+    with ThreadPoolExecutor(max_workers=len(storages)) as pool:
+        list(pool.map(exercise, range(len(storages))))
+
+    assert registry._bindings == {}

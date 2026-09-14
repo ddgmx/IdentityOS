@@ -43,6 +43,25 @@ def test_runtime_wires_and_releases_durable_acquisition(tmp_path):
             break
 
     assert task.status == TaskStatus.COMPLETED, task.error
+    assert [step.action for step in task.steps] == [
+        "registry_search",
+        "trust",
+        "dependencies",
+        "generate",
+        "validate",
+        "publish",
+        "install",
+        "activate",
+        "invoke",
+        "persist",
+        "reload",
+        "reuse",
+        "verify_goal",
+    ]
+    assert task.step_by_id("invoke").result["invoked"] is True
+    assert task.step_by_id("persist").result["persisted"] is True
+    assert task.step_by_id("reload").result["reloaded"] is True
+    assert task.step_by_id("reuse").result["reused"] is True
     assert runtime.capability_registry.get(identity.id, "calc") is not None
 
     runtime.shutdown()

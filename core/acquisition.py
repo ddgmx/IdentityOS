@@ -3,6 +3,8 @@
 Capability surfaces can request durable acquisition without importing the
 Executive implementation. Bindings retain and compare the actual storage
 object so a recycled ``id(storage)`` can never resolve an unrelated provider.
+Runtime owners register after construction and unregister during shutdown;
+registering a replacement for the same storage transfers ownership atomically.
 """
 
 from __future__ import annotations
