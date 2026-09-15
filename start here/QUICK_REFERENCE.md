@@ -48,6 +48,24 @@ cp -r ~/.identity_store/my_id ~/backups/my_id_$(date +%Y%m%d)
 /config set model gpt-4o|llama-3.3-70b|phi4-mini:latest
 ```
 
+## Multiple OpenAI-Compatible Providers (NEW!)
+```
+# In .env - each appears as separate adapter in chat selector:
+OPENAI_GEMINI_API_KEY=sk-...          # Google AI Studio
+OPENAI_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+OPENAI_GEMINI_MODEL=gemini-1.5-flash
+
+OPENAI_NVIDIA_API_KEY=sk-...          # NVIDIA NIM
+OPENAI_NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+OPENAI_NVIDIA_MODEL=nvidia/nemotron-3-ultra
+
+OPENAI_TOGETHER_API_KEY=sk-...        # Together AI
+OPENAI_TOGETHER_BASE_URL=https://api.together.xyz/v1
+OPENAI_TOGETHER_MODEL=meta-llama/Meta-Llama-3.1-70B-Instruct
+
+# Then in chat: /config set adapter gemini|nvidia|together
+```
+
 ## Capability Dev
 ```
 # Generate via chat: "I need a capability that..."
@@ -79,6 +97,19 @@ ANTHROPIC_API_KEY=sk-ant-...
 GROQ_API_KEY=gsk_...
 OPENROUTER_API_KEY=sk-or-...
 WORLDMONITOR_API_KEY=wm_...   # For authenticated skills
+
+# Multiple OpenAI-compatible (each = separate adapter):
+OPENAI_GEMINI_API_KEY=sk-...
+OPENAI_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+OPENAI_GEMINI_MODEL=gemini-1.5-flash
+
+OPENAI_NVIDIA_API_KEY=sk-...
+OPENAI_NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+OPENAI_NVIDIA_MODEL=nvidia/nemotron-3-ultra
+
+OPENAI_TOGETHER_API_KEY=sk-...
+OPENAI_TOGETHER_BASE_URL=https://api.together.xyz/v1
+OPENAI_TOGETHER_MODEL=meta-llama/Meta-Llama-3.1-70B-Instruct
 ```
 
 ## Emergency

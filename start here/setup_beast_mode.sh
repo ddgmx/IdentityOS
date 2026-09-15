@@ -72,6 +72,23 @@ cat > .env << 'EOF'
 # OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxx
 # WORLDMONITOR_API_KEY=wm_xxxxxxxxxxxx   # For full worldmonitor skills
 
+# --- Multiple OpenAI-Compatible Providers (NEW!) ---
+# Configure MULTIPLE OpenAI-compatible endpoints simultaneously!
+# Pattern: OPENAI_<NAME>_API_KEY, OPENAI_<NAME>_BASE_URL, OPENAI_<NAME>_MODEL
+# Each appears as a SEPARATE adapter option in chat selector!
+#
+# OPENAI_GEMINI_API_KEY=sk-xxxxxxxxxxxx
+# OPENAI_GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+# OPENAI_GEMINI_MODEL=gemini-1.5-flash
+#
+# OPENAI_NVIDIA_API_KEY=sk-xxxxxxxxxxxx
+# OPENAI_NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+# OPENAI_NVIDIA_MODEL=nvidia/nemotron-3-ultra
+#
+# OPENAI_TOGETHER_API_KEY=sk-xxxxxxxxxxxx
+# OPENAI_TOGETHER_BASE_URL=https://api.together.xyz/v1
+# OPENAI_TOGETHER_MODEL=meta-llama/Meta-Llama-3.1-70B-Instruct
+
 # --- Local Model (if using Ollama) ---
 # OLLAMA_BASE_URL=http://localhost:11434/v1
 # OLLAMA_MODEL=phi4-mini:latest
