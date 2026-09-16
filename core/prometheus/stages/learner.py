@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.prometheus.models import AcquisitionRecord
@@ -11,24 +8,7 @@ from core.prometheus.models import AcquisitionRecord
 _LEARNING_NAMESPACE = "prometheus_learning"
 
 
-def _get_learning_path(identity_id: str, storage) -> Path:
-    if hasattr(storage, 'root'):
-        base = Path(storage.root)
-    else:
-        base = Path(".identity_store")
-    path = base / identity_id / f"{_LEARNING_NAMESPACE}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _load_learning_data(identity_id: str, storage) -> Dict[str, Any]:
-    path = _get_learning_path(identity_id, storage)
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+def _empty_learning_data() -> Dict[str, Any]:
     return {
         "acquisitions": [],
         "capability_success": {},
@@ -36,23 +16,40 @@ def _load_learning_data(identity_id: str, storage) -> Dict[str, Any]:
     }
 
 
+def _load_learning_data(identity_id: str, storage) -> Dict[str, Any]:
+    load = getattr(storage, "load", None)
+    if not callable(load):
+        return _empty_learning_data()
+    persisted = load(identity_id, _LEARNING_NAMESPACE)
+    if not isinstance(persisted, dict):
+        return _empty_learning_data()
+    data = _empty_learning_data()
+    for key in data:
+        value = persisted.get(key)
+        if isinstance(value, type(data[key])):
+            data[key] = value
+    return data
+
+
 def _save_learning_data(identity_id: str, storage, data: dict) -> None:
-    path = _get_learning_path(identity_id, storage)
-    try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-    except IOError:
-        pass
+    save = getattr(storage, "save", None)
+    if callable(save):
+        save(identity_id, _LEARNING_NAMESPACE, data)
 
 
 def record_acquisition(
     identity_id: str,
     record: AcquisitionRecord,
     storage,
-) -> None:
+) -> bool:
     if not storage:
-        return
+        return False
     data = _load_learning_data(identity_id, storage)
+    if record.source_task_id and any(
+        item.get("source_task_id") == record.source_task_id
+        for item in data["acquisitions"]
+    ):
+        return False
     data["acquisitions"].append(record.to_dict())
     data["acquisitions"] = data["acquisitions"][-100:]
 
@@ -73,6 +70,7 @@ def record_acquisition(
         tc[cap_id] = tc.get(cap_id, 0) + 1
 
     _save_learning_data(identity_id, storage, data)
+    return True
 
 
 def get_success_rate(identity_id: str, cap_id: str, storage) -> float:

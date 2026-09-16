@@ -284,6 +284,8 @@ class IdentityRuntime:
                     capability_registry=self.capability_registry,
                 )
                 register_executive(self.executive)
+                if self.prometheus is not None:
+                    self.prometheus.attach_executive(self.executive)
             except Exception:
                 self.executive = None
 
@@ -368,6 +370,11 @@ class IdentityRuntime:
             if self.load(identity_id):
                 count += 1
         return count
+
+    def shutdown(self) -> None:
+        """Release runtime-owned background services and global bindings."""
+        if self.executive is not None:
+            self.executive.shutdown()
 
     def _load_persisted_memories(self, identity_id: str) -> int:
         if not self._storage:
@@ -903,6 +910,7 @@ class IdentityRuntime:
         stage_started = trace.start_stage()
         if self.prometheus:
             try:
+                self.prometheus.reconcile_executive(identity.id)
                 self.prometheus.begin_interaction(request.id)
                 _pre = self.prometheus.pre_check_and_evolve(
                     user_input=sanitized_input, identity_id=identity.id,

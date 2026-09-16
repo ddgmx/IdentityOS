@@ -1,7 +1,7 @@
 {
   "id": "datetime",
   "name": "DateTime",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "IdentityOS",
   "license": "MIT",
   "homepage": "https://github.com/lacebx/IdentityOS",
@@ -33,7 +33,7 @@
     },
     {
       "name": "datetime.zones",
-      "description": "List all supported timezone codes",
+      "description": "Describe supported timezone identifiers",
       "permission": "public"
     }
   ]
