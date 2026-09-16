@@ -4,110 +4,24 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-try:
-    import zoneinfo
-    _ZONEINFO_AVAILABLE = True
-except ImportError:
-    _ZONEINFO_AVAILABLE = False
-
 from core.capabilities.base import Capability, Skill, object_schema
 from core.capabilities.registry import register
 from core.capabilities.result import CapabilityResult
 
-# Common IANA timezone aliases for user-friendly input
-_IANA_ALIASES = {
-    # US timezones
-    "EST": "America/New_York",
-    "EDT": "America/New_York",
-    "CST": "America/Chicago",
-    "CDT": "America/Chicago",
-    "MST": "America/Denver",
-    "MDT": "America/Denver",
-    "PST": "America/Los_Angeles",
-    "PDT": "America/Los_Angeles",
-    "AKST": "America/Anchorage",
-    "AKDT": "America/Anchorage",
-    "HST": "Pacific/Honolulu",
-    "HDT": "Pacific/Honolulu",
-    # Common colloquial names
-    "NEW_YORK": "America/New_York",
-    "CHICAGO": "America/Chicago",
-    "DENVER": "America/Denver",
-    "LOS_ANGELES": "America/Los_Angeles",
-    "SAN_FRANCISCO": "America/Los_Angeles",
-    "SEATTLE": "America/Los_Angeles",
-    "PHOENIX": "America/Phoenix",
-    "ANCHORAGE": "America/Anchorage",
-    "HONOLULU": "Pacific/Honolulu",
-    # European timezones
-    "GMT": "Europe/London",
-    "BST": "Europe/London",
-    "UTC": "UTC",
-    "CET": "Europe/Berlin",
-    "CEST": "Europe/Berlin",
-    "EET": "Europe/Helsinki",
-    "EEST": "Europe/Helsinki",
-    "WET": "Europe/Lisbon",
-    "WEST": "Europe/Lisbon",
-    "LONDON": "Europe/London",
-    "PARIS": "Europe/Paris",
-    "BERLIN": "Europe/Berlin",
-    "ROME": "Europe/Rome",
-    "MADRID": "Europe/Madrid",
-    "AMSTERDAM": "Europe/Amsterdam",
-    "BRUSSELS": "Europe/Brussels",
-    "VIENNA": "Europe/Vienna",
-    "WARSAW": "Europe/Warsaw",
-    "MOSCOW": "Europe/Moscow",
-    "KYIV": "Europe/Kyiv",
-    "ISTANBUL": "Europe/Istanbul",
-    # Asian timezones
-    "IST": "Asia/Kolkata",
-    "JST": "Asia/Tokyo",
-    "KST": "Asia/Seoul",
-    "CST_CHINA": "Asia/Shanghai",
-    "HKT": "Asia/Hong_Kong",
-    "SINGAPORE": "Asia/Singapore",
-    "BANGKOK": "Asia/Bangkok",
-    "DUBAI": "Asia/Dubai",
-    "TEL_AVIV": "Asia/Jerusalem",
-    # Oceanic
-    "AEST": "Australia/Sydney",
-    "AEDT": "Australia/Sydney",
-    "ACST": "Australia/Adelaide",
-    "ACDT": "Australia/Adelaide",
-    "AWST": "Australia/Perth",
-    "NZST": "Pacific/Auckland",
-    "NZDT": "Pacific/Auckland",
-    "SYDNEY": "Australia/Sydney",
-    "MELBOURNE": "Australia/Melbourne",
-    "BRISBANE": "Australia/Brisbane",
-    "PERTH": "Australia/Perth",
-    "AUCKLAND": "Pacific/Auckland",
-    "WELLINGTON": "Pacific/Auckland",
+_KNOWN_ZONES = {
+    "UTC": 0,
+    "GMT": 0,
+    "EST": -5,
+    "CST": -6,
+    "MST": -7,
+    "PST": -8,
+    "CET": 1,
+    "EET": 2,
+    "IST": 5.5,
+    "JST": 9,
+    "AEST": 10,
+    "NZST": 12,
 }
-
-
-def _resolve_iana_zone(tz_name: str) -> str:
-    """Resolve a timezone name to an IANA zone identifier."""
-    upper = tz_name.upper().strip().replace(" ", "_")
-    if upper in _IANA_ALIASES:
-        return _IANA_ALIASES[upper]
-    # Check if it's already a valid IANA zone
-    if _ZONEINFO_AVAILABLE:
-        try:
-            zoneinfo.ZoneInfo(upper)
-            return upper
-        except Exception:
-            pass
-    # Try case-insensitive match
-    if _ZONEINFO_AVAILABLE:
-        for zone in zoneinfo.available_timezones():
-            if zone.upper() == upper:
-                return zone
-    raise ValueError(
-        f"Unknown timezone: {tz_name}. Use IANA names like 'America/New_York', 'Europe/London', etc."
-    )
 
 
 @register
@@ -118,7 +32,7 @@ class DateTimeCapability(Capability):
     author = "IdentityOS"
     license = "MIT"
     homepage = "https://github.com/lacebx/IdentityOS"
-    description = "Get current time in any IANA timezone, convert between zones, calculate date differences (full DST support)"
+    description = "Get current time in any timezone, convert between zones, calculate date differences"
     permissions = ["public"]
 
     def __init__(self, config: Optional[dict] = None) -> None:
@@ -135,8 +49,6 @@ class DateTimeCapability(Capability):
             "## DateTime Skills (MANDATORY — use when asked about time/date)",
             "When the user asks for the current time, date, or timezone conversion, you MUST use the skills below.",
             "Do NOT say you don't have real-time access. You DO. Use the skills.",
-            "Timezone names should be IANA format (e.g., 'America/New_York', 'Europe/London', 'Asia/Tokyo').",
-            "Common aliases like 'EST', 'PST', 'CET', 'London', 'Tokyo' are auto-resolved.",
         ]
 
     _SKILLS = [
@@ -272,9 +184,6 @@ class DateTimeCapability(Capability):
             "utc_offset_hours": self._offset_hours(now),
             "weekday": now.strftime("%A"),
         }
-        if upper in legacy_map:
-            return legacy_map[upper]
-        raise ValueError(f"Unknown timezone: {tz_name}")
 
     def _convert(
         self,
@@ -298,7 +207,8 @@ class DateTimeCapability(Capability):
             "difference_hours": delta,
         }
 
-    def _diff(self, date1: str = "", date2: str = "", **kwargs: Any) -> dict[str, Any]:
+    @staticmethod
+    def _diff(date1: str = "", date2: str = "", **kwargs: Any) -> dict[str, Any]:
         d1 = datetime.strptime(date1, "%Y-%m-%d") if date1 else datetime.now()
         d2 = datetime.strptime(date2, "%Y-%m-%d") if date2 else datetime.now()
         diff = abs((d2 - d1).days)
