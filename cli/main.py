@@ -792,11 +792,16 @@ def _interactive_adapter_select():
         if is_local:
             candidates.append(_probe_adapter(name, OllamaAdapter, model, base_url=base_url))
         else:
-            candidates.append(_probe_adapter(name, OpenAIAdapter, model, api_key=api_key, base_url=base_url))
+            # NVIDIA Nemotron models: disable thinking to prevent reasoning leakage
+            extra_body = {}
+            if "nvidia" in name.lower() or "nemotron" in model.lower():
+                extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            candidates.append(_probe_adapter(name, OpenAIAdapter, model, api_key=api_key, base_url=base_url, extra_body=extra_body))
 
     # Ollama (local) — auto-start the server if it isn't running, then offer it
     # Only add if not already discovered via OLLAMA_API_KEY
     has_explicit_ollama = any(p["name"] == "ollama" for p in openai_providers)
+    ollama_models = []
     if not has_explicit_ollama:
         ollama_ok, ollama_msg = _ensure_ollama_running()
         ollama_models = _fetch_ollama_models() if ollama_ok else []

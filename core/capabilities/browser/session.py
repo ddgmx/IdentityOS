@@ -222,8 +222,12 @@ def run_in_browser_thread(fn: Callable[[], T]) -> T:
     if threading.current_thread() is _WORKER:
         return fn()
     fut: Future = Future()
-    context = copy_context()
-    _JOBS.put((lambda: context.run(fn), fut))
+    try:
+        context = copy_context()
+        _JOBS.put((lambda: context.run(fn), fut))
+    except Exception:
+        # copy_context() may fail in greenlet/gevent environments
+        _JOBS.put((fn, fut))
     return fut.result(timeout=120)
 
 
@@ -376,24 +380,31 @@ def ensure_session(
                 if browser_launcher is None:
                     raise BrowserUnavailable(f"Browser type '{state.browser_type}' not available")
 
-                # Prepare launch arguments
-                launch_args = ["--disable-blink-features=AutomationControlled"]
+                # Prepare launch kwargs — avoid Chromium-only flags on Firefox.
+                launch_kwargs: dict[str, Any] = {
+                    "user_data_dir": str(profile_dir),
+                    "headless": headless,
+                    "viewport": {"width": 1400, "height": 900},
+                    "locale": "en-US",
+                }
                 if state.browser_type == "firefox":
-                    launch_args = ["-headless"] if headless else []
-
-                # Launch persistent context
-                state.context = browser_launcher.launch_persistent_context(
-                    user_data_dir=str(profile_dir),
-                    headless=headless,
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-US",
-                    user_agent=user_agent
-                    or (
+                    # Real Firefox profiles already define UA; don't force Chrome UA.
+                    if user_agent:
+                        launch_kwargs["user_agent"] = user_agent
+                    # Playwright Firefox accepts firefox_user_prefs
+                    launch_kwargs["firefox_user_prefs"] = {
+                        "dom.webdriver.enabled": False,
+                        "useAutomationExtension": False,
+                    }
+                else:
+                    launch_kwargs["user_agent"] = user_agent or (
                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    args=launch_args,
-                )
+                    )
+                    launch_kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+
+                # Launch persistent context
+                state.context = browser_launcher.launch_persistent_context(**launch_kwargs)
                 state.context.route(
                     "**/*",
                     lambda route: route.continue_()
