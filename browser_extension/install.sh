@@ -40,7 +40,7 @@ EOF
 
 echo "Native messaging host installed to $MANIFEST_DIR"
 
-# Build extension (zip for temporary installation)
+# Build extension (zip for local loading)
 cd "$EXTENSION_DIR"
 ZIP_FILE="/tmp/identityos_live_bridge.zip"
 rm -f "$ZIP_FILE"
