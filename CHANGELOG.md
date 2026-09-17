@@ -26,3 +26,17 @@ All notable changes to this project are documented here.
   ephemeral `secret-ref://` references. Only credential-aware skills such as
   `browser.login` may resolve them; generic automation (`browser.fill`,
   `browser.eval_js`, ...) rejects them.
+
+### Testing
+
+- `tests/test_live_bridge_e2e.py` spawns the real two-process bridge
+  (`native_host.py` SERVER + `--relay`) over stdio pipes and exercises
+  status/list_tabs/active_tab, command forwarding, disconnect errors, and
+  large frames; no Firefox is required.
+- `tests/test_native_host.py` covers the exact-read/exact-write framing
+  helpers under partial pipe and socket reads.
+- `tests/test_adapter_configuration.py` covers provider discovery, legacy
+  env combinations, local-endpoint (Ollama) selection, and routing of named
+  providers to dedicated adapters.
+- `tests/test_orchestrator.py` verifies the runtime wiring change, and
+  `tests/test_sensitive.py` verifies `secret-ref://` brokering rules.
