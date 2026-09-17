@@ -96,6 +96,65 @@ def test_legacy_single_provider_setup_remains_backward_compatible():
     assert adapter.model == "gpt-4o-mini"
 
 
+@pytest.mark.parametrize(
+    ("env", "expected_type"),
+    [
+        # Legacy OpenAI cloud: OPENAI_API_KEY + remote base
+        (
+            {"OPENAI_API_KEY": "legacy-key", "OPENAI_BASE_URL": "https://api.openai.com/v1"},
+            OpenAIAdapter,
+        ),
+        # Legacy OpenAI defaulting to a local Ollama endpoint
+        (
+            {
+                "OPENAI_API_KEY": "ollama",
+                "OPENAI_BASE_URL": "http://localhost:11434/v1",
+                "OLLAMA_MODEL": "llama3.2",
+            },
+            OllamaAdapter,
+        ),
+        # Legacy explicit Ollama
+        (
+            {
+                "OLLAMA_API_KEY": "ollama",
+                "OLLAMA_BASE_URL": "http://localhost:11434/v1",
+                "OLLAMA_MODEL": "qwen2.5:3b",
+            },
+            OllamaAdapter,
+        ),
+        # Named provider with a local endpoint keeps local semantics
+        (
+            {
+                "OPENAI_OLLAMA_API_KEY": "local-key",
+                "OPENAI_OLLAMA_BASE_URL": "http://localhost:11434/v1",
+                "OPENAI_OLLAMA_MODEL": "qwen3:4b",
+            },
+            OllamaAdapter,
+        ),
+    ],
+)
+def test_legacy_env_combos_stay_backward_compatible(env, expected_type):
+    adapter = build_adapter_from_env(env)
+    assert isinstance(adapter, expected_type)
+
+
+def test_legacy_openai_and_explicit_ollama_form_fallback_chain():
+    adapter = build_adapter_from_env({
+        "OPENAI_API_KEY": "openai-key",
+        "OPENAI_BASE_URL": "https://api.openai.com/v1",
+        "OPENAI_MODEL": "gpt-4o",
+        "OLLAMA_API_KEY": "ollama",
+        "OLLAMA_BASE_URL": "http://localhost:11434/v1",
+        "OLLAMA_MODEL": "llama3.2",
+    })
+    assert isinstance(adapter, ChainAdapter)
+    assert [type(item).__name__ for item in adapter.adapters] == [
+        "OpenAIAdapter",
+        "OllamaAdapter",
+    ]
+    assert [item.model for item in adapter.adapters] == ["gpt-4o", "llama3.2"]
+
+
 def test_placeholder_values_are_treated_as_unconfigured():
     assert _discover_openai_providers({
         "OPENAI_API_KEY": "PLACEHOLDER_API_KEY",

@@ -53,6 +53,35 @@ and may only be resolved by credential-aware skills such as `browser.login`.
 Generic automation skills (fill/type/eval_js) reject secret references.
 See `runtime/sensitive.py` and `docs/architecture/pr-102-changes.md`.
 
+## Security model
+
+- **Process privileges**: the Firefox-spawned host (SERVER) runs as the
+  current user — the same privilege as Firefox — and never elevates. The
+  relay IdentityOS spawns runs under the IdentityOS process. No subprocess is
+  launched by either host, and neither host evaluates or executes shell or
+  dynamic code.
+- **Socket**: the server binds a per-user Unix socket under `$TMPDIR`
+  (`identityos_live_bridge_<uid>.sock`), reachable only by the same user and
+  the relay process IdentityOS runs as. It accepts no network connections.
+- **Extension permissions** (`browser_extension/manifest.json`): the add-on
+  requests `nativeMessaging`, `tabs`, `activeTab`, and `scripting`. `activeTab`
+  scopes tab-controlling operations to the user's currently active tab;
+  `scripting` is only exercised when the agent explicitly calls
+  `browser.eval_js`. The content script is passive (`document_idle`) and only
+  relays state the agent asked for.
+- **Scope gates**: live reads (`browser:live_read`, `browser:live_tabs`) and
+  writes (`browser:live_write`) are separate capabilities; an agent identity
+  only gets the scopes granted for it.
+- **Credentials**: login material is brokered as ephemeral `secret-ref://`
+  references and never sent to a model provider or persisted in identity
+  state; only `browser.login` may resolve them (`runtime/sensitive.py`).
+- **Observability**: `browser.live.status` reports whether the user's Firefox
+  is connected; a disconnected extension is surfaced as an explicit error
+  rather than a silent success.
+- **Troubleshooting**: if a tab change does not appear, verify the extension
+  is still connected (`browser.live.status`) before anything else — state is
+  a live snapshot pushed by the extension, not a guess by the model.
+
 ## Configuration
 
 Multiple OpenAI-compatible providers may be configured purely through the
