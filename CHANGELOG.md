@@ -40,3 +40,18 @@ All notable changes to this project are documented here.
   providers to dedicated adapters.
 - `tests/test_orchestrator.py` verifies the runtime wiring change, and
   `tests/test_sensitive.py` verifies `secret-ref://` brokering rules.
+
+### Risk and rollback
+
+- Additive by default: existing single-provider setups, legacy env vars, and
+  `browser.*` behavior are unchanged unless the new `browser.live.*` scopes or
+  named providers are used.
+- The `runtime/orchestrator.py` change is session-scoped secret bookkeeping
+  only (merge on session resolution, consume on successful tool call, clear on
+  session end); it delegates policy to `runtime/sensitive.py` and is covered
+  by tests.
+- The bridge fails safe: when Firefox is not connected, requests return an
+  explicit error instead of a silent success, and the native host never
+  evaluates shell or dynamic code.
+- Rolling back is removing the branch; no data migrations or state format
+  changes are introduced.
