@@ -36,7 +36,25 @@ class PrometheusEngine:
         self.pipeline = EvolutionPipeline(config=self.config)
         self.capability_registry = capability_registry
         self.storage = storage
+        self.executive = None
         self._evolving = False
+
+    def attach_executive(self, executive) -> None:
+        """Attach the evidence authority used for durable acquisitions."""
+        self.executive = executive
+
+    def reconcile_executive(self, identity_id: str) -> List[str]:
+        if self.executive is None or self.storage is None:
+            return []
+        from core.prometheus.executive_reconciler import (
+            reconcile_executive_acquisitions,
+        )
+
+        return reconcile_executive_acquisitions(
+            identity_id,
+            self.executive,
+            self.storage,
+        )
 
     def begin_interaction(self, interaction_id: str) -> None:
         self.pipeline.begin_interaction(interaction_id)
@@ -177,14 +195,17 @@ class PrometheusEngine:
     def history(self, identity_id: str) -> List[dict]:
         if not self.storage:
             return []
+        self.reconcile_executive(identity_id)
         return get_evidence_history(identity_id, self.storage)
 
     def cap_success_rate(self, identity_id: str, cap_id: str) -> float:
         if not self.storage:
             return 0.0
+        self.reconcile_executive(identity_id)
         return get_success_rate(identity_id, cap_id, self.storage)
 
     def known_caps_for(self, identity_id: str, keyword: str) -> List[str]:
         if not self.storage:
             return []
+        self.reconcile_executive(identity_id)
         return get_known_capabilities_for_task(identity_id, keyword, self.storage)

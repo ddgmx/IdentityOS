@@ -41,7 +41,7 @@
     {
       "id": "datetime",
       "name": "DateTime",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "Timezone conversion, date math, current time",
       "author": "IdentityOS",
       "skills": 4,
@@ -54,9 +54,9 @@
       "id": "web",
       "name": "Web",
       "version": "1.0.0",
-      "description": "Fetch web pages and extract text from URLs",
+      "description": "Fetch web pages, search the web, and extract text from URLs",
       "author": "IdentityOS",
-      "skills": 2,
+      "skills": 3,
       "permissions": [
         "public"
       ],
@@ -68,7 +68,7 @@
       "version": "1.0.0",
       "description": "Person-like web surfing: search, score usefulness, open pages, click/type/login, authenticated sessions",
       "author": "IdentityOS",
-      "skills": 22,
+      "skills": 37,
       "permissions": [
         "public",
         "network",
@@ -199,7 +199,7 @@
     {
       "id": "registry_manager",
       "name": "Registry Manager",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "List, publish, and install capabilities from the registry",
       "author": "IdentityOS",
       "skills": 3,

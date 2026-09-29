@@ -635,10 +635,29 @@ class TestBenchmarkProvenance:
         assert "identity inspect ${{ env.BENCHMARK_IDENTITY }}" not in scheduled
         assert (
             "- name: Comment benchmark summary on PR\n"
-            "        if: github.event_name == 'pull_request'"
+            "        if: always() && !cancelled() && "
+            "github.event_name == 'pull_request'"
         ) in pr_workflow
         assert "Report advisory regression observations" in pr_workflow
         assert "Single-run score regression against the verified observed champion" in pr_workflow
+        assert "python scripts/benchmark_ci_retry.py" in pr_workflow
+        assert "--attempts 2" in pr_workflow
+        assert "--max-wait-seconds 900" in pr_workflow
+        assert "continue-on-error: true" in pr_workflow
+        assert "benchmark-failure-state/" in pr_workflow
+        assert "if: always() && !cancelled() && env.CAN_RUN_PROVIDER_BENCHMARK == 'true'" in pr_workflow
+        assert "Report benchmark runtime failure after preserving evidence" in pr_workflow
+        assert "No score or champion promotion is claimed" in pr_workflow
+        retry_step = pr_workflow.index("- name: Run IdentityBench smoke suite")
+        upload_step = pr_workflow.index("- name: Upload benchmark artifacts")
+        comment_step = pr_workflow.index("- name: Comment benchmark summary on PR")
+        failure_step = pr_workflow.index(
+            "- name: Report benchmark runtime failure after preserving evidence"
+        )
+        assert retry_step < upload_step < comment_step < failure_step
+        failure_block = pr_workflow[failure_step:]
+        assert "steps.benchmark-runtime.outcome == 'failure'" in failure_block
+        assert "exit 1" in failure_block
         assert "--baseline champion" in pr_workflow
         assert "--baseline champion" in scheduled
         assert "regression-check.txt" in pr_workflow

@@ -2,10 +2,9 @@
 executor.py — Generic step executor.
 
 Executes one ``TaskStep`` at a time, producing evidence for every step.
-The executor knows step *action types* (registry_search, generate, validate,
-publish, install, verify, verify_goal) — it never knows individual capability
-names.  It also passes through planner-style file actions so plans produced
-by the planner execute with the same persistence and evidence guarantees.
+The executor knows generic lifecycle actions, never individual capability
+names. It also passes through planner-style file actions so plans produced by
+the planner execute with the same persistence and evidence guarantees.
 
 Every handler returns ``(success, result_dict, evidence_list)``.
 """
@@ -20,7 +19,11 @@ from typing import Any, Optional
 
 from core.executive.models import Evidence, ReplayPolicy, Task, TaskStep
 from core.executive.templates import capability_module
-from core.executive.verification import capability_module_path, verify_capability
+from core.executive.verification import (
+    capability_module_path,
+    verification_probe,
+    verify_capability,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -67,17 +70,136 @@ def replay_policy_for_action(action: str) -> ReplayPolicy:
     return _REPLAY_POLICIES.get(action, ReplayPolicy.BLOCK)
 
 
+def rollback_acquisition(task: Task, ctx: ExecutionContext) -> list[Evidence]:
+    """Compensate a newly created installation after terminal verification failure.
+
+    Never uninstall a capability that pre-dated this task. The evidence is
+    returned to the engine so rollback failure is visible rather than hidden.
+    """
+    install_step = task.step_by_id("install")
+    if (
+        install_step is None
+        or install_step.result.get("already_installed")
+        or not install_step.result.get("installed")
+        or ctx.capability_registry is None
+    ):
+        return []
+    cap_id = str(install_step.result["installed"])
+    try:
+        ctx.capability_registry.uninstall(ctx.identity_id, cap_id)
+        install_step.result["rolled_back"] = True
+        return [Evidence(
+            step="rollback",
+            label="acquisition_rolled_back",
+            detail=f"removed newly installed {cap_id} after lifecycle failure",
+            success=True,
+            data={"capability": cap_id},
+        )]
+    except Exception as exc:
+        install_step.result["rollback_failed"] = True
+        return [Evidence(
+            step="rollback",
+            label="acquisition_rollback_failed",
+            detail=f"failed to remove {cap_id}: {exc}",
+            success=False,
+            data={"capability": cap_id, "error": str(exc)},
+        )]
+
+
 # ── Generic acquisition handlers ────────────────────────────────────────
 
 def _registry_search(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
     cap = step.params.get("capability", "")
     found, candidate = _search_marketplace(cap)
+    manifest = _load_capability_manifest(candidate) if candidate else {}
     evidence = [Evidence(
         step=step.action, label="registry_search",
         detail=f"found={found} candidate={candidate or 'none'}", success=True,
-        data={"capability": cap, "found": found, "candidate": candidate},
+        data={
+            "capability": cap,
+            "found": found,
+            "candidate": candidate,
+            "version": manifest.get("version"),
+            "author": manifest.get("author"),
+        },
     )]
-    return (True, {"found": found, "candidate": candidate}, evidence)
+    return (True, {
+        "found": found,
+        "candidate": candidate,
+        "manifest": manifest,
+    }, evidence)
+
+
+def _trust(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    """Apply Prometheus' marketplace trust policy before installation."""
+    cap = _resolve_capability(task, step)
+    manifest = _load_capability_manifest(cap)
+    if not manifest:
+        return (False, {"trusted": False}, [Evidence(
+            step=step.action,
+            label="trust_verified",
+            detail=f"manifest missing for registry capability {cap}",
+            success=False,
+            data={"capability": cap},
+        )])
+    try:
+        from core.prometheus.models import AcquisitionMode, RegistryCandidate
+        from core.prometheus.stages.trust_verifier import is_trusted, verify_trust
+
+        candidate = RegistryCandidate(
+            cap_id=cap,
+            name=manifest.get("name", cap),
+            version=manifest.get("version", "0.0.0"),
+            author=manifest.get("author", "unknown"),
+            description=manifest.get("description", ""),
+            skills=manifest.get("skills", []),
+            permissions=manifest.get("permissions", {}),
+            dependencies=manifest.get("dependencies", []),
+            manifest_url=f"registry/capabilities/{cap}/manifest.json",
+        )
+        score = verify_trust(candidate, mode=AcquisitionMode.AUTOMATIC)
+        trusted = is_trusted(candidate, mode=AcquisitionMode.AUTOMATIC)
+        return (trusted, {
+            "trusted": trusted,
+            "score": score,
+            "author": candidate.author,
+        }, [Evidence(
+            step=step.action,
+            label="trust_verified",
+            detail=f"{cap} trust score={score:.3f} trusted={trusted}",
+            success=trusted,
+            data={"capability": cap, "score": score, "author": candidate.author},
+        )])
+    except Exception as exc:
+        return (False, {"trusted": False}, [Evidence(
+            step=step.action,
+            label="trust_verified",
+            detail=f"trust verification failed: {exc}",
+            success=False,
+            data={"capability": cap, "error": str(exc)},
+        )])
+
+
+def _dependencies(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    cap = _resolve_capability(task, step)
+    manifest = _load_capability_manifest(cap)
+    required = [str(dep) for dep in manifest.get("dependencies", [])]
+    installed = {
+        getattr(item, "id", "")
+        for item in (ctx.capability_registry.list(ctx.identity_id) if ctx.capability_registry else [])
+    }
+    missing = [dep for dep in required if dep not in installed]
+    ok = not missing
+    return (ok, {
+        "dependencies": required,
+        "missing": missing,
+    }, [Evidence(
+        step=step.action,
+        label="dependencies_resolved",
+        detail=(f"all dependencies available for {cap}" if ok else f"missing dependencies: {', '.join(missing)}"),
+        success=ok,
+        data={"capability": cap, "required": required, "missing": missing},
+    )])
 
 
 def _generate(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
@@ -108,7 +230,7 @@ def _generate(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, 
 
 
 def _validate(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
-    cap = step.params.get("capability", "")
+    cap = _resolve_capability(task, step)
     path = capability_module_path(cap)
     evidence: list = []
     ok = True
@@ -177,15 +299,251 @@ def _install(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, d
         lookup(cap)  # must be registered before install
         if ctx.capability_registry is None:
             return (False, {}, [Evidence(step=step.action, label="installed", detail="no capability registry available", success=False)])
-        cap_obj = ctx.capability_registry.install(ctx.identity_id, cap)
+        cap_obj = ctx.capability_registry.get(ctx.identity_id, cap)
+        already_installed = cap_obj is not None
+        if cap_obj is None:
+            cap_obj = ctx.capability_registry.install(ctx.identity_id, cap)
         evidence = [Evidence(
             step=step.action, label="installed",
-            detail=f"{cap} installed for {ctx.identity_id}", success=True,
-            data={"capability": cap, "identity_id": ctx.identity_id, "skills": [s.name for s in cap_obj.skills()]},
+            detail=(
+                f"{cap} already installed for {ctx.identity_id}"
+                if already_installed
+                else f"{cap} installed for {ctx.identity_id}"
+            ),
+            success=True,
+            data={
+                "capability": cap,
+                "identity_id": ctx.identity_id,
+                "skills": [s.name for s in cap_obj.skills()],
+                "already_installed": already_installed,
+            },
         )]
-        return (True, {"installed": cap, "skills": [s.name for s in cap_obj.skills()]}, evidence)
+        return (True, {
+            "installed": cap,
+            "skills": [s.name for s in cap_obj.skills()],
+            "already_installed": already_installed,
+        }, evidence)
     except Exception as e:
         return (False, {}, [Evidence(step=step.action, label="installed", detail=f"install failed: {e}", success=False, data={"error": str(e)})])
+
+
+def _activate(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    """Prove the installed capability is exposed and authorized for a safe probe."""
+    cap_id = _resolve_capability(task, step)
+    registry = ctx.capability_registry
+    if registry is None:
+        return (False, {}, [Evidence(
+            step=step.action,
+            label="activation_failed",
+            detail="no capability registry available",
+            success=False,
+        )])
+    cap = registry.get(ctx.identity_id, cap_id)
+    if cap is None:
+        return (False, {"activated": False}, [Evidence(
+            step=step.action,
+            label="activation_failed",
+            detail=f"{cap_id} is not installed",
+            success=False,
+        )])
+    probe = verification_probe(cap)
+    if probe is None:
+        return (False, {
+            "activated": False,
+            "reason": "no skill declares safe verification parameters",
+        }, [Evidence(
+            step=step.action,
+            label="safe_probe_missing",
+            detail=f"{cap_id} has no declared harmless verification probe",
+            success=False,
+            data={"capability": cap_id},
+        )])
+    skill, params = probe
+    allowed, reason = registry.can(ctx.identity_id, skill.name)
+    if not allowed:
+        return (False, {
+            "blocked": True,
+            "block_type": "authorization_required",
+            "activated": False,
+            "capability": cap_id,
+            "skill": skill.name,
+            "permission": skill.permission,
+            "reason": reason,
+        }, [Evidence(
+            step=step.action,
+            label="authorization_required",
+            detail=reason,
+            success=False,
+            data={
+                "capability": cap_id,
+                "skill": skill.name,
+                "permission": skill.permission,
+            },
+        )])
+    return (True, {
+        "activated": True,
+        "capability": cap_id,
+        "skill": skill.name,
+        "params": params,
+    }, [Evidence(
+        step=step.action,
+        label="capability_activated",
+        detail=f"{skill.name} is exposed and authorized",
+        success=True,
+        data={"capability": cap_id, "skill": skill.name, "permission": skill.permission},
+    )])
+
+
+def _invoke(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    cap_id = _resolve_capability(task, step)
+    registry = ctx.capability_registry
+    cap = registry.get(ctx.identity_id, cap_id) if registry is not None else None
+    probe = verification_probe(cap) if cap is not None else None
+    if registry is None or probe is None:
+        return (False, {"invoked": False}, [Evidence(
+            step=step.action,
+            label="safe_probe_invoked",
+            detail="installed capability or safe probe unavailable",
+            success=False,
+            data={"capability": cap_id},
+        )])
+    skill, params = probe
+    try:
+        result = registry.call(ctx.identity_id, skill.name, **params)
+        ok = bool(getattr(result, "success", False))
+        result_evidence = (
+            result.to_evidence_dict()
+            if hasattr(result, "to_evidence_dict")
+            else {"success": ok}
+        )
+        return (ok, {
+            "invoked": ok,
+            "skill": skill.name,
+            "params": params,
+            "result": result_evidence,
+        }, [Evidence(
+            step=step.action,
+            label="safe_probe_invoked",
+            detail=f"{skill.name} {'succeeded' if ok else 'failed'} through capability gateway",
+            success=ok,
+            data={"capability": cap_id, "skill": skill.name, "result": result_evidence},
+        )])
+    except Exception as exc:
+        return (False, {"invoked": False}, [Evidence(
+            step=step.action,
+            label="safe_probe_invoked",
+            detail=f"gateway invocation failed: {exc}",
+            success=False,
+            data={"capability": cap_id, "skill": skill.name, "error": str(exc)},
+        )])
+
+
+def _persist(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    cap_id = _resolve_capability(task, step)
+    raw = ctx.storage.load(ctx.identity_id, "capabilities") if ctx.storage is not None else None
+    entries = raw.get("installed", []) if isinstance(raw, dict) else []
+    entry = next((item for item in entries if item.get("id") == cap_id), None)
+    ok = entry is not None
+    return (ok, {
+        "persisted": ok,
+        "entry": entry or {},
+    }, [Evidence(
+        step=step.action,
+        label="installation_persisted",
+        detail=(f"{cap_id} found in durable capability state" if ok else f"{cap_id} missing from durable capability state"),
+        success=ok,
+        data={"capability": cap_id, "entry": entry or {}},
+    )])
+
+
+def _reload(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    cap_id = _resolve_capability(task, step)
+    if ctx.storage is None:
+        return (False, {"reloaded": False}, [Evidence(
+            step=step.action,
+            label="capability_reloaded",
+            detail="no persistent storage available",
+            success=False,
+        )])
+    try:
+        from core.capabilities.registry import CapabilityRegistry
+
+        fresh_registry = CapabilityRegistry(ctx.storage)
+        cap = fresh_registry.get(ctx.identity_id, cap_id)
+        probe = verification_probe(cap) if cap is not None else None
+        allowed, reason = (
+            fresh_registry.can(ctx.identity_id, probe[0].name)
+            if probe is not None
+            else (False, "safe probe unavailable after reload")
+        )
+        ok = cap is not None and probe is not None and allowed
+        return (ok, {
+            "reloaded": ok,
+            "capability": cap_id,
+            "skill": probe[0].name if probe else None,
+            "reason": reason,
+        }, [Evidence(
+            step=step.action,
+            label="capability_reloaded",
+            detail=(f"{cap_id} reloaded with an authorized probe" if ok else f"reload verification failed: {reason}"),
+            success=ok,
+            data={"capability": cap_id, "skill": probe[0].name if probe else None},
+        )])
+    except Exception as exc:
+        return (False, {"reloaded": False}, [Evidence(
+            step=step.action,
+            label="capability_reloaded",
+            detail=f"reload failed: {exc}",
+            success=False,
+            data={"capability": cap_id, "error": str(exc)},
+        )])
+
+
+def _reuse(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
+    cap_id = _resolve_capability(task, step)
+    if ctx.storage is None:
+        return (False, {"reused": False}, [Evidence(
+            step=step.action,
+            label="capability_reused",
+            detail="no persistent storage available",
+            success=False,
+        )])
+    try:
+        from core.capabilities.registry import CapabilityRegistry
+
+        fresh_registry = CapabilityRegistry(ctx.storage)
+        cap = fresh_registry.get(ctx.identity_id, cap_id)
+        probe = verification_probe(cap) if cap is not None else None
+        if probe is None:
+            raise RuntimeError("safe probe unavailable after reload")
+        skill, params = probe
+        result = fresh_registry.call(ctx.identity_id, skill.name, **params)
+        ok = bool(getattr(result, "success", False))
+        result_evidence = (
+            result.to_evidence_dict()
+            if hasattr(result, "to_evidence_dict")
+            else {"success": ok}
+        )
+        return (ok, {
+            "reused": ok,
+            "skill": skill.name,
+            "params": params,
+            "result": result_evidence,
+        }, [Evidence(
+            step=step.action,
+            label="capability_reused",
+            detail=f"{skill.name} {'succeeded' if ok else 'failed'} after fresh registry reload",
+            success=ok,
+            data={"capability": cap_id, "skill": skill.name, "result": result_evidence},
+        )])
+    except Exception as exc:
+        return (False, {"reused": False}, [Evidence(
+            step=step.action,
+            label="capability_reused",
+            detail=f"post-reload invocation failed: {exc}",
+            success=False,
+            data={"capability": cap_id, "error": str(exc)},
+        )])
 
 
 def _verify(task: Task, step: TaskStep, ctx: ExecutionContext) -> tuple[bool, dict, list]:
@@ -281,10 +639,17 @@ def _passthrough_command(task: Task, step: TaskStep, ctx: ExecutionContext) -> t
 
 _HANDLERS: dict[str, Any] = {
     "registry_search": _registry_search,
+    "trust": _trust,
+    "dependencies": _dependencies,
     "generate": _generate,
     "validate": _validate,
     "publish": _publish,
     "install": _install,
+    "activate": _activate,
+    "invoke": _invoke,
+    "persist": _persist,
+    "reload": _reload,
+    "reuse": _reuse,
     "verify": _verify,
     "verify_goal": _verify_goal,
     # planner passthrough
@@ -305,9 +670,16 @@ _HANDLERS: dict[str, Any] = {
 # from this set is treated as outcome-unknown after an interrupted attempt.
 _REPLAY_POLICIES: dict[str, ReplayPolicy] = {
     "registry_search": ReplayPolicy.RETRY,
+    "trust": ReplayPolicy.RETRY,
+    "dependencies": ReplayPolicy.RETRY,
     "generate": ReplayPolicy.RETRY,
     "validate": ReplayPolicy.RETRY,
     "install": ReplayPolicy.RETRY,
+    "activate": ReplayPolicy.RETRY,
+    "invoke": ReplayPolicy.RETRY,
+    "persist": ReplayPolicy.RETRY,
+    "reload": ReplayPolicy.RETRY,
+    "reuse": ReplayPolicy.RETRY,
     "verify": ReplayPolicy.RETRY,
     "create_directory": ReplayPolicy.RETRY,
     "write_file": ReplayPolicy.RETRY,
@@ -319,13 +691,19 @@ _REPLAY_POLICIES: dict[str, ReplayPolicy] = {
 
 
 def _load_manifest_skills(cap_id: str) -> list:
+    return _load_capability_manifest(cap_id).get("skills", [])
+
+
+def _load_capability_manifest(cap_id: Optional[str]) -> dict:
+    if not cap_id:
+        return {}
     manifest_path = _REPO_ROOT / "registry" / "capabilities" / cap_id / "manifest.json"
     try:
         with open(manifest_path) as f:
             manifest = json.load(f)
-        return manifest.get("skills", [])
+        return manifest if isinstance(manifest, dict) else {}
     except Exception:
-        return []
+        return {}
 
 
 def _search_marketplace(capability: str) -> tuple[bool, Optional[str]]:

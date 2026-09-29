@@ -9,7 +9,8 @@ checks, in order:
   3. capability class is registered
   4. capability is installed for the identity
   5. the capability exposes at least one callable skill
-  6. calling a skill with explicit verification parameters succeeds
+  6. calling a skill with explicit verification parameters succeeds through
+     the permission-enforcing runtime gateway
 
 If any check fails the corresponding Evidence is marked failed and the
 caller (executor) decides whether to retry or mark the task failed.
@@ -28,6 +29,19 @@ _CORE_CAPS_DIR = Path(__file__).resolve().parent.parent / "capabilities"
 
 def capability_module_path(capability_id: str) -> Path:
     return _CORE_CAPS_DIR / capability_id / "__init__.py"
+
+
+def verification_probe(capability: Any) -> tuple[Any, dict[str, Any]] | None:
+    """Return the first capability-declared harmless probe, if one exists.
+
+    Probe parameters are part of the skill contract. The executive never
+    invents arguments and never treats an import-only check as behavioral
+    proof.
+    """
+    for skill in capability.skills():
+        if skill.verification_params is not None:
+            return skill, dict(skill.verification_params or {})
+    return None
 
 
 def verify_capability(
@@ -131,13 +145,28 @@ def verify_capability(
                 )
                 if probe is not None:
                     params = dict(probe.verification_params or {})
-                    res = cap.call(probe.name, **params)
+                    allowed, reason = capability_registry.can(identity_id, probe.name)
+                    if not allowed:
+                        callable_data = {
+                            "callable": False,
+                            "executed": False,
+                            "skill": probe.name,
+                            "params": params,
+                            "reason": reason,
+                        }
+                        raise PermissionError(reason)
+                    res = capability_registry.call(identity_id, probe.name, **params)
                     callable_ok = bool(getattr(res, "success", False))
                     callable_data = {
                         "callable": callable_ok,
                         "executed": True,
                         "skill": probe.name,
                         "params": params,
+                        "result": (
+                            res.to_evidence_dict()
+                            if hasattr(res, "to_evidence_dict")
+                            else {"success": callable_ok}
+                        ),
                     }
                 else:
                     callable_data["reason"] = (

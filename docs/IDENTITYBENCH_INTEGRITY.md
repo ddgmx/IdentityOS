@@ -172,6 +172,24 @@ weekly/monthly, journal, and AI-review workloads. It reduces avoidable overlap;
 it does not raise the organization quota, suppress a 429, or make a failed run
 eligible.
 
+The pull-request smoke workflow gives a terminal organization-level provider
+cooldown one bounded retry. It waits for the longest provider-advertised
+cooldown, plus a small grace period, capped at 15 minutes. Before retrying, it
+copies the failed attempt as workflow evidence and restores both
+`.identity_store` and `.identitybench` to their pre-attempt state. Partial runs
+therefore cannot train the identity, enter trend history, or become a baseline.
+Non-rate-limit failures are not retried. If the second attempt fails, artifact
+upload and the PR explanation run first, followed by a terminal failing step;
+`continue-on-error` is used only to preserve evidence and cannot make the job
+green.
+
+The retry wrapper lives under `scripts/`, outside the executable
+`identitybench` package. Operational CI changes must not alter the evaluator's
+suite fingerprint. A real evaluator change still produces an incomparable
+signature and starts a new observed chain; an unchanged suite restores the
+existing main high-water champion, which can only be retained or advanced
+under its score and guardrail rules.
+
 ## Comparison eligibility
 
 Every schema-v3 run records, and the workflow attests:

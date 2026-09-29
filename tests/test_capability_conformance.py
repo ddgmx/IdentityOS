@@ -69,6 +69,7 @@ def test_marketplace_only_advertises_registered_conformant_capabilities():
         }
 
         assert entry["url"] == f"{entry['id']}/manifest.json"
+        assert entry["version"] == manifest["version"] == capability.version
         assert entry["skills"] == len(runtime_skills)
         assert manifest["id"] == entry["id"]
         assert manifest_skills == runtime_skills
@@ -92,9 +93,11 @@ def test_fresh_identity_installs_all_capabilities_and_reloads_them(tmp_path):
 
     restarted = CapabilityRegistry(JSONFileBackend(root_dir=str(store_path)))
     assert [capability.id for capability in restarted.list(identity_id)] == expected
-    result = restarted.call(identity_id, "datetime.now", tz_name="UTC")
+    result = restarted.call(
+        identity_id, "datetime.now", tz_name="America/Chicago"
+    )
     assert result.success is True
-    assert result.data["timezone"] == "UTC"
+    assert result.data["timezone"] == "America/Chicago"
 
 
 def test_analysis_capabilities_report_absent_benchmarks_as_observed_no_data(
@@ -140,6 +143,86 @@ def test_registry_publish_refuses_to_replace_existing_manifest(tmp_path):
     assert manifest.read_text() == original_manifest
     index = json.loads((registry_root / "index.json").read_text())
     assert index["capabilities"][0]["version"] == "1.0.0"
+
+
+def test_registry_manager_lists_and_resolves_authoritative_marketplace(tmp_path):
+    registry = CapabilityRegistry(
+        JSONFileBackend(root_dir=str(tmp_path / "store"))
+    )
+    identity_id = "marketplace-registry-manager"
+    registry.install(identity_id, "registry_manager")
+
+    listed = registry.call(identity_id, "registry_manager.list_capabilities")
+    assert listed.success is True
+    expected_ids = [entry["id"] for entry in _marketplace_entries()]
+    assert [entry["id"] for entry in listed.data["capabilities"]] == expected_ids
+    assert listed.data["count"] == len(expected_ids)
+
+    registry.grant(identity_id, "registry_manager", "capability:manage")
+    resolved = registry.call(
+        identity_id,
+        "registry_manager.install_capability",
+        cap_id="architecture_analysis",
+    )
+    assert resolved.success is True
+    assert resolved.data["cap_id"] == "architecture_analysis"
+    assert resolved.data["status"] == "ready_to_install"
+
+
+def test_registry_manager_falls_back_to_legacy_root_index(tmp_path):
+    registry_root = tmp_path / "legacy-registry"
+    registry_root.mkdir()
+    (registry_root / "index.json").write_text(
+        json.dumps(
+            {
+                "capabilities": [
+                    {
+                        "id": "legacy_demo",
+                        "name": "Legacy Demo",
+                        "version": "1.0.0",
+                        "description": "Root-index compatibility fixture",
+                        "skills": [],
+                    }
+                ]
+            }
+        )
+    )
+
+    manager = lookup("registry_manager")()
+    manager._registry_path = lambda: str(registry_root)  # type: ignore[method-assign]
+
+    listed = manager.call("registry_manager.list_capabilities")
+
+    assert listed.success is True
+    assert listed.data["count"] == 1
+    assert listed.data["capabilities"][0]["id"] == "legacy_demo"
+
+
+def test_registry_manager_loads_version_1_state_with_compatible_skills(tmp_path):
+    storage = JSONFileBackend(root_dir=str(tmp_path / "store"))
+    identity_id = "registry-manager-v1-upgrade"
+    storage.save(
+        identity_id,
+        CapabilityRegistry.CAP_NAMESPACE,
+        {
+            "installed": [
+                {"id": "registry_manager", "version": "1.0.0", "config": {}}
+            ]
+        },
+    )
+
+    registry = CapabilityRegistry(storage)
+    manager = registry.get(identity_id, "registry_manager")
+
+    assert manager is not None
+    assert manager.version == "1.1.0"
+    assert {skill.name for skill in manager.skills()} == {
+        "registry_manager.list_capabilities",
+        "registry_manager.publish_capability",
+        "registry_manager.install_capability",
+    }
+    result = registry.call(identity_id, "registry_manager.list_capabilities")
+    assert result.success is True
 
 
 def test_every_local_marketplace_skill_executes_through_gateway(tmp_path):
