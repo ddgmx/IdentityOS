@@ -560,6 +560,23 @@ class TestLearner:
         record_acquisition("test-bot", record, tmp_storage)
         assert has_previously_searched("test-bot", "weather", tmp_storage)
 
+    def test_storage_without_a_real_path_never_writes_to_working_directory(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        storage = MagicMock()
+        storage.load.return_value = None
+
+        assert _load_learning_data("tester", storage) == {
+            "acquisitions": [],
+            "capability_success": {},
+            "task_capability_map": {},
+        }
+        assert list(tmp_path.iterdir()) == []
+        storage.load.assert_called_once_with("tester", "prometheus_learning")
+
 
 # ─── Evidence Recorder Tests ────────────────────────────────────────────
 
@@ -588,3 +605,99 @@ class TestEvidenceRecorder:
         assert len(history) == 1
         assert history[0]["chosen_capability"] == "github"
         assert history[0]["installation_success"] is True
+
+    def test_in_memory_backend_round_trip_uses_storage_contract(self):
+        from runtime.persistence import InMemoryBackend
+
+        storage = InMemoryBackend()
+        record = AcquisitionRecord(
+            need=CapabilityNeed(skill_keywords=["weather"]),
+            chosen_candidate=RegistryCandidate(
+                cap_id="weather", name="Weather", version="1.0.0",
+                author="IdentityOS", description="", skills=[],
+                permissions={}, manifest_url="",
+            ),
+            installation_success=True,
+            validation_success=True,
+            retry_success=True,
+        )
+
+        record_evidence("memory-backed", record, storage)
+
+        assert get_evidence_history("memory-backed", storage)[0][
+            "chosen_capability"
+        ] == "weather"
+        assert storage.load("memory-backed", "prometheus_evidence") == {
+            "entries": get_evidence_history("memory-backed", storage),
+        }
+
+
+def test_terminal_executive_acquisition_is_learned_exactly_once(tmp_path):
+    from core.capabilities.registry import CapabilityRegistry
+    from core.executive import ExecutiveRuntime
+    from core.executive.models import TaskStatus
+    from runtime.persistence import JSONFileBackend
+
+    storage = JSONFileBackend(root_dir=str(tmp_path / "store"))
+    registry = CapabilityRegistry(storage)
+    executive = ExecutiveRuntime(storage=storage, capability_registry=registry)
+    task = executive.create_acquisition_task(
+        identity_id="reconcile-test",
+        capability_id="calc",
+        goal="install calc capability",
+    )
+    for _ in range(50):
+        executive.process_ready("reconcile-test")
+        current = executive.get_task("reconcile-test", task.task_id)
+        if current.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            break
+    assert current.status == TaskStatus.COMPLETED, current.error
+
+    prometheus = PrometheusEngine(
+        capability_registry=registry,
+        storage=storage,
+    )
+    prometheus.attach_executive(executive)
+    first_history = prometheus.history("reconcile-test")
+    second_history = prometheus.history("reconcile-test")
+    learning = storage.load("reconcile-test", "prometheus_learning")
+
+    assert len(first_history) == len(second_history) == 1
+    assert first_history[0]["source_task_id"] == task.task_id
+    assert first_history[0]["status"] == AcquisitionStatus.SUCCEEDED.value
+    assert first_history[0]["installation_success"] is True
+    assert first_history[0]["validation_success"] is True
+    assert len(learning["acquisitions"]) == 1
+    assert learning["acquisitions"][0]["source_task_id"] == task.task_id
+    assert prometheus.cap_success_rate("reconcile-test", "calc") == 1.0
+    executive.shutdown()
+
+
+def test_source_task_id_makes_prometheus_writes_idempotent(tmp_path):
+    from runtime.persistence import JSONFileBackend
+
+    storage = JSONFileBackend(root_dir=str(tmp_path / "store"))
+    record = AcquisitionRecord(
+        need=CapabilityNeed(skill_keywords=["calc"]),
+        chosen_candidate=RegistryCandidate(
+            cap_id="calc",
+            name="Calculator",
+            version="1.0.0",
+            author="IdentityOS",
+            description="",
+            skills=[],
+            permissions={},
+            manifest_url="",
+        ),
+        installation_success=True,
+        validation_success=True,
+        retry_success=True,
+        source_task_id="task-123",
+    )
+
+    assert record_acquisition("idempotent", record, storage) is True
+    assert record_acquisition("idempotent", record, storage) is False
+    assert record_evidence("idempotent", record, storage) is True
+    assert record_evidence("idempotent", record, storage) is False
+    assert len(storage.load("idempotent", "prometheus_learning")["acquisitions"]) == 1
+    assert len(get_evidence_history("idempotent", storage)) == 1

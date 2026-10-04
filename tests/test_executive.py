@@ -5,7 +5,7 @@ Covers the identity-runtime executive subsystem:
   1. Data model & state machine (legal/illegal transitions, progress).
   2. Persistence: tasks survive engine restart; interruption recovery.
   3. Generic capability acquisition end-to-end with per-step evidence.
-  4. Marketplace-found capability skips generate/validate/publish.
+  4. Marketplace-found capability skips generation/publish but is validated.
   5. Queue ordering by priority, scheduler background execution.
   6. Failure / retry / force-resume / cancel / pause semantics.
   7. Evidence rules: every completed step has real evidence; no hallucination.
@@ -30,6 +30,7 @@ from core.executive.engine import get_executive_for, register_executive
 from core.executive.models import Task, TaskStatus, TaskStep, TaskStepStatus
 from core.executive.state import IllegalTransition
 from core.executive.workflow import extract_capability_name, is_acquisition_goal
+from core.skill_forge import AcceptanceCase, ForgeProposal, SkillForge
 from runtime.persistence import JSONFileBackend
 
 
@@ -49,9 +50,74 @@ def registry(storage):
     return CapabilityRegistry(storage=storage)
 
 
+class _ForgeDesigner:
+    def design(self, request, identity=None):
+        return [
+            AcceptanceCase(
+                name="metadata is observable",
+                skill=f"{request.capability_id}.info",
+                expected={"capability": request.capability_id, "status": "available"},
+            ),
+            AcceptanceCase(
+                name="metadata is stable for a second invocation",
+                skill=f"{request.capability_id}.info",
+                expected={"capability": request.capability_id, "status": "available"},
+            ),
+        ]
+
+
+class _ForgeAuthor:
+    def author(self, request, identity=None):
+        cap_id = request.capability_id
+        class_name = "".join(part.title() for part in cap_id.split("_")) + "Capability"
+        source = f'''from typing import Any
+from core.capabilities.base import Capability, Skill
+from core.capabilities.registry import register
+from core.capabilities.result import CapabilityResult
+@register
+class {class_name}(Capability):
+    id = "{cap_id}"
+    name = "{cap_id.replace('_', ' ').title()}"
+    version = "1.0.0"
+    author = "executive-test"
+    description = "Expose truthful capability metadata"
+    permissions = ["public"]
+    def install(self, identity_id: str, storage: Any) -> None:
+        storage.save(identity_id, "capability.{cap_id}", {{"installed": True}})
+    def uninstall(self, identity_id: str, storage: Any) -> None:
+        storage.delete(identity_id, "capability.{cap_id}")
+    def prompts(self, identity_id: str) -> list[str]:
+        return ["Use {cap_id}.info for metadata."]
+    def skills(self) -> list[Skill]:
+        return [Skill(name="{cap_id}.info", description="Return metadata", verification_params={{}})]
+    def call(self, skill_name: str, **params: Any) -> CapabilityResult:
+        if skill_name != "{cap_id}.info":
+            return CapabilityResult.fail(self.id, skill_name, "unknown_skill", "unknown skill")
+        return CapabilityResult.ok(self.id, skill_name, {{"capability": self.id, "status": "available"}}, source="metadata")
+'''
+        return ForgeProposal(source=source, manifest={
+            "id": cap_id,
+            "name": cap_id.replace("_", " ").title(),
+            "version": "1.0.0",
+            "author": "executive-test",
+            "description": "Expose truthful capability metadata",
+            "permissions": ["public"],
+            "dependencies": [],
+            "skills": [{"name": f"{cap_id}.info", "description": "Return metadata"}],
+        })
+
+
+def _test_forge():
+    return SkillForge(
+        os.path.normpath(os.path.join(os.path.dirname(__file__), "..")),
+        author=_ForgeAuthor(),
+        test_designer=_ForgeDesigner(),
+    )
+
+
 @pytest.fixture()
 def engine(storage, registry):
-    eng = ExecutiveRuntime(storage=storage, capability_registry=registry)
+    eng = ExecutiveRuntime(storage=storage, capability_registry=registry, skill_forge=_test_forge())
     register_executive(eng)
     yield eng
     eng.shutdown()
@@ -73,6 +139,7 @@ def _cleanup_generated(cap_id):
     for rel in (
         f"core/capabilities/{cap_id}",
         f"registry/capabilities/{cap_id}",
+        f".identity_forge/artifacts/{cap_id}",
     ):
         p = os.path.normpath(os.path.join(root, rel))
         if os.path.isdir(p):
@@ -96,6 +163,7 @@ def _cleanup_generated(cap_id):
         data["capabilities"] = [c for c in caps if c.get("id") != cap_id]
         with open(root_index, "w") as f:
             json.dump(data, f, indent=2)
+            f.write("\n")
 
 
 @pytest.fixture()
@@ -160,7 +228,9 @@ def test_never_silently_abandon_queued_task():
 # ── 2. Persistence & interruption recovery ───────────────────────────────
 
 def test_task_persists_across_engine_restart(storage, registry, fresh_cap):
-    eng1 = ExecutiveRuntime(storage=storage, capability_registry=registry)
+    eng1 = ExecutiveRuntime(
+        storage=storage, capability_registry=registry, skill_forge=_test_forge(),
+    )
     t = eng1.start_task(
         f"create a {fresh_cap} capability and install it",
         "tester", original_request=f"create a {fresh_cap} capability and install it",
@@ -171,7 +241,9 @@ def test_task_persists_across_engine_restart(storage, registry, fresh_cap):
     assert len(t1.evidence) >= 1
 
     # brand-new engine over the same storage == interrupted process resumed
-    eng2 = ExecutiveRuntime(storage=storage, capability_registry=registry)
+    eng2 = ExecutiveRuntime(
+        storage=storage, capability_registry=registry, skill_forge=_test_forge(),
+    )
     recovered = eng2.recover("tester")
     assert any(r.task_id == t.task_id for r in recovered)
     final = _run_until_terminal(eng2, "tester", t.task_id)
@@ -284,31 +356,44 @@ def test_full_acquisition_flow_with_evidence(engine, fresh_cap):
         "tester", original_request=f"create a {fresh_cap} capability and install it",
     )
     actions = [s.action for s in t.steps]
-    assert actions == ["registry_search", "generate", "validate", "publish", "install", "verify", "verify_goal"]
+    assert actions == [
+        "registry_search", "trust", "dependencies", "generate", "validate",
+        "publish", "install", "activate", "invoke", "persist", "reload",
+        "reuse", "verify_goal",
+    ]
 
     final = _run_until_terminal(engine, "tester", t.task_id)
     assert final.status == TaskStatus.COMPLETED, final.error
 
     completed = [s.action for s in final.completed_steps]
-    assert "generate" in completed and "install" in completed and "verify" in completed
+    assert "generate" in completed and "install" in completed and "reuse" in completed
 
     labels = {e.label for e in final.evidence}
-    for expected in ("file_generated", "syntax_valid", "registry_published", "installed", "source_file_exists", "module_imports", "registered", "skill_exposed", "skill_callable"):
+    for expected in (
+        "behavioral_tests_isolated", "artifact_packaged", "file_generated",
+        "syntax_valid", "interface_valid",
+        "registry_published", "installed", "capability_activated",
+        "safe_probe_invoked", "installation_persisted",
+        "capability_reloaded", "capability_reused",
+    ):
         assert expected in labels, f"missing evidence label {expected}"
 
 
 def test_marketplace_found_skips_generation(engine):
     t = engine.start_task(
-        "create a command_exec capability and install it",
-        "tester", original_request="create a command_exec capability and install it",
+        "create a calc capability and install it",
+        "tester", original_request="create a calc capability and install it",
     )
     final = _run_until_terminal(engine, "tester", t.task_id)
-    assert final.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+    assert final.status == TaskStatus.COMPLETED, final.error
     statuses = {s.action: s.status for s in final.steps}
     assert statuses["registry_search"] == TaskStepStatus.COMPLETED
+    assert statuses["trust"] == TaskStepStatus.COMPLETED
+    assert statuses["dependencies"] == TaskStepStatus.COMPLETED
     assert statuses["generate"] == TaskStepStatus.SKIPPED
-    assert statuses["validate"] == TaskStepStatus.SKIPPED
+    assert statuses["validate"] == TaskStepStatus.COMPLETED
     assert statuses["publish"] == TaskStepStatus.SKIPPED
+    assert statuses["reuse"] == TaskStepStatus.COMPLETED
 
 
 def test_running_step_blocks_later_steps(engine):
@@ -352,28 +437,130 @@ def test_generation_refuses_to_overwrite_existing_capability(engine):
 
 
 def test_loose_capability_name_resolves_canonical_id(engine):
-    """'command' in the goal must install the marketplace canonical id."""
+    """Loose names resolve canonically without bypassing sensitive grants."""
     t = engine.start_task(
         "create a command execution capability and install it",
         "tester", original_request="create a command execution capability and install it",
     )
     final = _run_until_terminal(engine, "tester", t.task_id)
-    assert final.status == TaskStatus.COMPLETED, final.error
+    assert final.status == TaskStatus.BLOCKED
     install_evidence = [e for e in final.evidence if e.label == "installed" and e.success]
     assert install_evidence, "expected successful install evidence"
     assert any("command_exec" in (e.detail or "") for e in install_evidence)
+    assert any(e.label == "authorization_required" for e in final.evidence)
 
 
-def test_verify_calls_first_skill_not_assumed_info(engine):
-    """Verification must call the capability's real first skill, not .info."""
+def test_safe_probe_uses_gateway_after_explicit_permission(engine):
+    """A sensitive probe blocks, then executes only after an explicit grant."""
     t = engine.start_task(
         "create a command_exec capability and install it",
         "tester", original_request="create a command_exec capability and install it",
     )
     final = _run_until_terminal(engine, "tester", t.task_id)
+    assert final.status == TaskStatus.BLOCKED
+    assert engine.process_ready("tester")["advanced"] == 0
+
+    engine.capability_registry.grant(
+        "tester", "command_exec", "process:execute"
+    )
+    resumed = engine.resume_task("tester", t.task_id)
+    assert resumed.status == TaskStatus.RUNNING
+    final = _run_until_terminal(engine, "tester", t.task_id)
     assert final.status == TaskStatus.COMPLETED, final.error
-    skill_calls = [e for e in final.evidence if e.label == "skill_callable"]
-    assert skill_calls and all(e.success for e in skill_calls)
+    skill_calls = [
+        e for e in final.evidence
+        if e.label in ("safe_probe_invoked", "capability_reused")
+    ]
+    assert len(skill_calls) == 2 and all(e.success for e in skill_calls)
+
+
+def test_registry_manager_queues_and_completes_durable_lifecycle(engine):
+    registry = engine.capability_registry
+    registry.install("manager-test", "registry_manager")
+    registry.grant("manager-test", "registry_manager", "capability:manage")
+
+    result = registry.call(
+        "manager-test",
+        "registry_manager.install_capability",
+        cap_id="calc",
+    )
+
+    assert result.success is True
+    assert result.data["status"] == "queued"
+    assert result.data["created"] is True
+    assert result.data["task_id"]
+    assert result.data["stages"][-4:] == ["persist", "reload", "reuse", "verify_goal"]
+
+    final = _run_until_terminal(engine, "manager-test", result.data["task_id"])
+    assert final.status == TaskStatus.COMPLETED, final.error
+    assert registry.get("manager-test", "calc") is not None
+    assert any(e.label == "capability_reused" and e.success for e in final.evidence)
+
+    repeated = registry.call(
+        "manager-test",
+        "registry_manager.install_capability",
+        cap_id="calc",
+    )
+    assert repeated.success is True
+    assert repeated.data["created"] is False
+    assert repeated.data["status"] == "completed"
+    assert repeated.data["task_id"] == result.data["task_id"]
+
+
+def test_lifecycle_survives_restart_between_persist_and_reload(storage):
+    from core.capabilities.registry import CapabilityRegistry
+
+    registry1 = CapabilityRegistry(storage)
+    engine1 = ExecutiveRuntime(storage=storage, capability_registry=registry1)
+    task = engine1.create_acquisition_task(
+        identity_id="restart-test",
+        capability_id="calc",
+        goal="install calc capability",
+    )
+    while True:
+        engine1.process_ready("restart-test")
+        current = engine1.get_task("restart-test", task.task_id)
+        if current.step_by_id("persist").status == TaskStepStatus.COMPLETED:
+            break
+    engine1.shutdown()
+
+    registry2 = CapabilityRegistry(storage)
+    engine2 = ExecutiveRuntime(storage=storage, capability_registry=registry2)
+    engine2.recover("restart-test")
+    final = _run_until_terminal(engine2, "restart-test", task.task_id)
+
+    assert final.status == TaskStatus.COMPLETED, final.error
+    assert registry2.get("restart-test", "calc") is not None
+    assert final.step_by_id("reload").result["reloaded"] is True
+    assert final.step_by_id("reuse").result["reused"] is True
+    engine2.shutdown()
+
+
+def test_failed_new_install_is_rolled_back(engine):
+    task = engine.start_task(
+        "install a capability without a safe probe",
+        "rollback-test",
+        capability_id="file_tools",
+        steps=[
+            TaskStep(
+                action="install",
+                description="Install file tools",
+                params={"capability": "file_tools"},
+            ),
+            TaskStep(
+                action="activate",
+                description="Activate file tools",
+                params={"capability": "file_tools"},
+            ),
+        ],
+    )
+
+    final = _run_until_terminal(engine, "rollback-test", task.task_id)
+
+    assert final.status == TaskStatus.FAILED
+    assert engine.capability_registry.get("rollback-test", "file_tools") is None
+    assert final.step_by_id("install").result["rolled_back"] is True
+    assert any(e.label == "acquisition_rolled_back" for e in final.evidence)
 
 
 def test_generic_plan_no_hardcoded_capability_names(engine, fresh_cap):
@@ -555,7 +742,30 @@ def test_extract_capability_name_variants():
     assert extract_capability_name("build a browser skill") == "browser"
     assert extract_capability_name("make an ocr capability") == "ocr"
     assert extract_capability_name("install docker capability") == "docker"
+    assert extract_capability_name("build me a weather skill") == "weather"
+    assert extract_capability_name(
+        "create a capability to speak and install it"
+    ) == "speak"
+    assert extract_capability_name("create a capability called help") == "help"
+    assert extract_capability_name(
+        "Please BUILD A 'DATA_SYNC' SKILL"
+    ) == "data_sync"
+    assert extract_capability_name(
+        'create a capability named "Mixed_Case"'
+    ) == "mixed_case"
     assert extract_capability_name("what is the weather") is None
+
+
+def test_extract_capability_name_rejects_conversational_filler():
+    fillers = (
+        "why", "well", "so", "ok", "no", "yes", "can", "give", "we",
+        "ive", "now", "what", "great", "nice", "hey", "sure", "to",
+        "please", "come", "help",
+    )
+    for filler in fillers:
+        assert extract_capability_name(
+            f"create a capability to {filler} and install it"
+        ) is None, f"{filler!r} should not become a capability name"
 
 
 def test_is_acquisition_goal():
@@ -588,7 +798,7 @@ def test_status_questions_are_not_acquisition_goals():
 
 def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
     """Prometheus delegation must not re-commit on questions, and must not
-    re-queue a capability that already completed."""
+    duplicate active work. Stale completion claims are re-verified."""
     from core.executive.workflow import build_acquisition_plan
     from core.prometheus.models import CapabilityNeed, EvolutionResult
     from core.prometheus.pipeline import EvolutionPipeline
@@ -633,10 +843,11 @@ def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
         make_need("exec_test_q", "create a exec_test_q capability and install it"),
         "tester", rt, storage, None,
     )
-    assert not res.acquired and "already active" in (res.acquisition_record.error or "")
+    assert not res.acquired and "already queued" in (res.acquisition_record.error or "")
 
-    # 4) A completed capability must not be re-queued.  Finish the step-2
-    #    task (running -> completed) so only the terminal check applies.
+    # 4) A completed task with no installed capability is not runtime proof.
+    #    Finish the step-2 task without installing anything, then confirm a
+    #    fresh acquisition is queued to establish reality.
     from core.executive.models import TaskStatus
     from core.executive.state import can_transition, transition as _transition
     _active = rt.executive.active_tasks("tester")[0]
@@ -657,7 +868,9 @@ def test_delegate_to_executive_skips_status_questions_and_duplicates(tmp_path):
         make_need("exec_test_q", "create a exec_test_q capability and install it"),
         "tester", rt, storage, None,
     )
-    assert not res.acquired and "already completed" in (res.acquisition_record.error or "")
+    assert res.success is True
+    assert res.acquisition_record.error is None
+    assert len(rt.executive.active_tasks("tester")) == 1
 
 
 def test_registry_reload_binds_storage(tmp_path):

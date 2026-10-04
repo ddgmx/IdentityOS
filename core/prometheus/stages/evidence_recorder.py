@@ -1,41 +1,35 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Optional
-
 from core.prometheus.models import AcquisitionRecord
 
 
 _EVIDENCE_NAMESPACE = "prometheus_evidence"
 
 
-def _get_evidence_path(identity_id: str, storage) -> Optional[Path]:
-    if hasattr(storage, 'root'):
-        base = Path(storage.root)
-    else:
-        base = Path(".identity_store")
-    path = base / identity_id / f"{_EVIDENCE_NAMESPACE}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def record_evidence(
     identity_id: str,
     record: AcquisitionRecord,
     storage,
-) -> None:
-    path = _get_evidence_path(identity_id, storage)
-    if not path:
-        return
+) -> bool:
+    load = getattr(storage, "load", None)
+    save = getattr(storage, "save", None)
+    if not callable(load) or not callable(save):
+        return False
 
-    evidence = []
-    if path.exists():
-        try:
-            with open(path) as f:
-                evidence = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            evidence = []
+    persisted = load(identity_id, _EVIDENCE_NAMESPACE)
+    if isinstance(persisted, list):
+        # Backward compatibility with the original direct JSON-file format.
+        evidence = persisted
+    elif isinstance(persisted, dict) and isinstance(persisted.get("entries"), list):
+        evidence = persisted["entries"]
+    else:
+        evidence = []
+
+    if record.source_task_id and any(
+        item.get("source_task_id") == record.source_task_id
+        for item in evidence
+    ):
+        return False
 
     entry = {
         "timestamp": record.timestamp,
@@ -54,23 +48,21 @@ def record_evidence(
         "status": record.status.value,
         "mode": record.mode.value,
         "error": record.error,
+        "source_task_id": record.source_task_id,
     }
     evidence.append(entry)
     evidence = evidence[-200:]
-
-    try:
-        with open(path, "w") as f:
-            json.dump(evidence, f, indent=2)
-    except IOError:
-        pass
+    save(identity_id, _EVIDENCE_NAMESPACE, {"entries": evidence})
+    return True
 
 
 def get_evidence_history(identity_id: str, storage) -> list:
-    path = _get_evidence_path(identity_id, storage)
-    if not path or not path.exists():
+    load = getattr(storage, "load", None)
+    if not callable(load):
         return []
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return []
+    persisted = load(identity_id, _EVIDENCE_NAMESPACE)
+    if isinstance(persisted, list):
+        return persisted
+    if isinstance(persisted, dict) and isinstance(persisted.get("entries"), list):
+        return persisted["entries"]
+    return []

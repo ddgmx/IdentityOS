@@ -10,8 +10,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core.channels.context import ChannelContext, channel_authority
 from core.cognitive_engine import ComposedContext, ContextComposer
 from core.migrations import (
     MigrationManager,
@@ -167,6 +169,7 @@ class InteractionRequest:
     session_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    channel_context: Optional[ChannelContext] = None
 
 @dataclass
 class InteractionResponse:
@@ -246,6 +249,9 @@ class IdentityRuntime:
         self._session_fact_stores: Dict[str, FactStore] = {}
         self._session_tools_offered: set[str] = set()
         self._executive_recovered: set[str] = set()
+        # Session-scoped secret references (identity_id, user_id) -> {secret_ref: plaintext}
+        # These are ephemeral and automatically expire after use or timeout
+        self._session_secrets: Dict[str, Dict[str, str]] = {}
         self._storage = storage
 
         self._migration_registry = MigrationRegistry()
@@ -271,18 +277,79 @@ class IdentityRuntime:
             except Exception:
                 self.prometheus = None
 
+        self.skill_forge = None
         self.executive = None
+        self.reflex_engine = None
+        self.embodiment_hub = None
         if self._storage is not None:
             try:
                 from core.executive import ExecutiveRuntime
                 from core.executive.engine import register_executive
+                from core.skill_forge import (
+                    ModelCapabilityAuthor,
+                    ModelCapabilityTestDesigner,
+                    SkillForge,
+                )
+                if self.adapter is not None:
+                    self.skill_forge = SkillForge(
+                        Path(__file__).resolve().parent.parent,
+                        author=ModelCapabilityAuthor(self.adapter),
+                        test_designer=ModelCapabilityTestDesigner(self.adapter),
+                    )
                 self.executive = ExecutiveRuntime(
                     storage=self._storage,
                     capability_registry=self.capability_registry,
+                    skill_forge=self.skill_forge,
                 )
                 register_executive(self.executive)
-            except Exception:
+            except Exception as exc:
+                self.skill_forge = None
                 self.executive = None
+                self._emit_subsystem_failure("executive_initialization", exc)
+
+            if self.executive is not None:
+                try:
+                    from core.reflexes import ReflexEngine
+
+                    self.reflex_engine = ReflexEngine(
+                        self._storage, self.executive, self.capability_registry,
+                    )
+                except Exception as exc:
+                    self.reflex_engine = None
+                    self._emit_subsystem_failure("reflex_initialization", exc)
+
+                try:
+                    from core.embodiment import CapabilityDeviceAdapter, EmbodimentHub
+
+                    self.embodiment_hub = EmbodimentHub(
+                        self._storage, self.executive,
+                    )
+                    self.executive.embodiment_hub = self.embodiment_hub
+                    self.embodiment_hub.attach(CapabilityDeviceAdapter(
+                        self.capability_registry,
+                        "browser",
+                        device_id="browser_runtime",
+                        kind="browser",
+                        name="IdentityOS Browser",
+                    ))
+                    self.embodiment_hub.attach(CapabilityDeviceAdapter(
+                        self.capability_registry,
+                        "command_exec",
+                        device_id="desktop_runtime",
+                        kind="desktop",
+                        actions=["run"],
+                        name="IdentityOS Desktop Executor",
+                    ))
+                except Exception as exc:
+                    self.embodiment_hub = None
+                    self.executive.embodiment_hub = None
+                    self._emit_subsystem_failure("embodiment_initialization", exc)
+
+                if self.prometheus is not None:
+                    try:
+                        self.prometheus.attach_executive(self.executive)
+                    except Exception as exc:
+                        self._emit_subsystem_failure("prometheus_executive_attachment", exc)
 
     def _emit(self, event_type: EventType, identity_id=None, session_id=None, **payload):
         self.event_bus.emit(
@@ -365,6 +432,11 @@ class IdentityRuntime:
             if self.load(identity_id):
                 count += 1
         return count
+
+    def shutdown(self) -> None:
+        """Release runtime-owned background services and global bindings."""
+        if self.executive is not None:
+            self.executive.shutdown()
 
     def _load_persisted_memories(self, identity_id: str) -> int:
         if not self._storage:
@@ -745,6 +817,11 @@ class IdentityRuntime:
             self._save_session_fact_store(session_id)
         self._session_fact_stores.pop(session_id, None)
         self._session_tools_offered.discard(session_id)
+        # Clean up session-scoped secrets
+        if identity_id:
+            for user_id in list(self._session_secrets.keys()):
+                if user_id.startswith(f"{identity_id}:"):
+                    del self._session_secrets[user_id]
         if identity_id:
             self._emit(EventType.SESSION_ENDED, identity_id=identity_id, session_id=session_id)
 
@@ -769,6 +846,7 @@ class IdentityRuntime:
             except Exception:
                 pass
 
+    @channel_authority
     def process(self, request: InteractionRequest, top_k_memories: int = 3) -> InteractionResponse:
         trace = InteractionTrace(request.id)
         stage_started = trace.start_stage()
@@ -826,6 +904,13 @@ class IdentityRuntime:
             )
         self._sessions.setdefault(session_id, identity.id)
         self._session_users.setdefault(session_id, user_id)
+
+        # Merge session-scoped secrets with this interaction's secrets
+        session_key = f"{identity.id}:{user_id}"
+        session_secrets = self._session_secrets.get(session_key, {})
+        merged_secrets = {**session_secrets, **interaction_secrets}
+        self._session_secrets[session_key] = merged_secrets
+
         trace.end_stage("session_resolution", stage_started)
 
         self._emit(EventType.MESSAGE_RECEIVED, identity_id=identity.id,
@@ -884,10 +969,32 @@ class IdentityRuntime:
                 _executive_state_block = ""
         trace.end_stage("executive", stage_started)
 
+        # Promoted exact-match procedures can skip model planning, but they
+        # still enter the durable Executive and the normal post-processing,
+        # evaluation, memory, timeline, and persistence path below.
+        _reflex_dispatch = None
+        stage_started = trace.start_stage()
+        if self.reflex_engine is not None and not interaction_secrets and request.channel_context is None:
+            allowed, _ = self.capability_registry.can(identity.id, "reflex.execute")
+            if allowed:
+                try:
+                    _reflex_dispatch = self.reflex_engine.dispatch(
+                        identity.id, sanitized_input, autostart=True,
+                    )
+                except Exception as exc:
+                    self._emit_subsystem_failure(
+                        "reflex_dispatch",
+                        exc,
+                        identity_id=identity.id,
+                        session_id=session_id,
+                    )
+        trace.end_stage("reflex", stage_started)
+
         _prometheus_evolved = False
         stage_started = trace.start_stage()
-        if self.prometheus:
+        if self.prometheus and _reflex_dispatch is None and request.channel_context is None:
             try:
+                self.prometheus.reconcile_executive(identity.id)
                 self.prometheus.begin_interaction(request.id)
                 _pre = self.prometheus.pre_check_and_evolve(
                     user_input=sanitized_input, identity_id=identity.id,
@@ -915,8 +1022,33 @@ class IdentityRuntime:
             limit=self.max_tools_per_request,
         )
         _evidence_results: List[Dict[str, Any]] = []
+        if _reflex_dispatch is not None:
+            _evidence_results.append({
+                "capability": "reflex",
+                "action": "reflex.execute",
+                "success": True,
+                "confidence": 1.0,
+                "duration_ms": _reflex_dispatch["timings_ms"]["total"],
+                "error": None,
+            })
+        from core.self_knowledge import SelfKnowledge, needs_grounding, grounding_context, guard_response, SECTIONS, grounding_sections
+        _self_reader = SelfKnowledge(self._storage, identity.id) if self._storage else None
+        # Only attach sections relevant to the question: the full snapshot's
+        # capabilities inventory alone is ~4k tokens, which single-handedly
+        # pushed grounded chat turns past provider TPM limits.
+        _grounding_snapshot = (
+            _self_reader.snapshot(sections=grounding_sections(sanitized_input))
+            if _self_reader and needs_grounding(sanitized_input) else None
+        )
+        _grounding_metadata = None
+        if _grounding_snapshot is not None:
+            _tool_defs.append({"type":"function", "function":{
+                "name":"identity__self__inspect", "description":"Read sanitized authoritative self-state; no model or side effects",
+                "parameters":{"type":"object","properties":{"sections":{"type":"array","items":{"type":"string","enum":list(SECTIONS)}}},"additionalProperties":False}}})
+
 
         def _execute_tool_call(func_name: str, args: Any) -> str:
+            nonlocal _grounding_snapshot
             t0 = _time_mod.monotonic()
             if isinstance(args, str):
                 try:
@@ -925,6 +1057,21 @@ class IdentityRuntime:
                     args = {}
             if not isinstance(args, dict):
                 args = {}
+
+            if func_name in ("identity__self__inspect", "identity.self.inspect") and _grounding_snapshot is not None:
+                if set(args) - {"sections"}:
+                    return json.dumps({"error":"self inspection cannot select another identity"})
+                try:
+                    requested = args.get("sections")
+                    if requested is not None and (not isinstance(requested, list) or any(x not in SECTIONS for x in requested)):
+                        raise ValueError('invalid sections')
+                    _grounding_snapshot = _self_reader.snapshot()
+                    view = dict(_grounding_snapshot)
+                    if requested is not None:
+                        view['sections'] = {name:view['sections'][name] for name in requested}
+                    return json.dumps(view)
+                except (ValueError, TypeError):
+                    return json.dumps({"error":"invalid self-state sections"})
 
             # Some models reproduce the canonical dotted skill name even
             # though providers require the offered ``__``-safe name. Resolve
@@ -946,11 +1093,12 @@ class IdentityRuntime:
                 params.update(args["params"])
 
             try:
-                params = resolve_sensitive_parameters(params, interaction_secrets)
+                params = resolve_sensitive_parameters(params, merged_secrets, skill_name)
                 result = self.capability_registry.call(
                     identity.id,
                     skill_name,
                     execution_scope=f"user:{user_id}",
+                    adapter=self.adapter,
                     **params,
                 )
                 duration_ms = (_time_mod.monotonic() - t0) * 1000
@@ -969,6 +1117,12 @@ class IdentityRuntime:
                     "error": {"message": err_msg} if err_msg else None,
                 })
                 if success:
+                    # Consume used secret references from session store
+                    session_key = f"{identity.id}:{user_id}"
+                    if session_key in self._session_secrets:
+                        for ref, val in list(self._session_secrets[session_key].items()):
+                            if ref in str(params):
+                                del self._session_secrets[session_key][ref]
                     return _serialize_tool_result(data, self.max_tool_result_chars)
                 return _serialize_tool_result(
                     {"error": err_msg or "Skill reported failure"},
@@ -999,6 +1153,7 @@ class IdentityRuntime:
             emotion_state=emotion_state,
             capability_prompts=cap_prompts if cap_prompts else None,
             evidence_results=None,
+            channel_context=request.channel_context,
         )
         trace.end_stage("context_composition", stage_started)
 
@@ -1008,13 +1163,39 @@ class IdentityRuntime:
         if _executive_state_block:
             context.custom_blocks["executive_state"] = _executive_state_block
 
+        if _grounding_snapshot is not None:
+            context.custom_blocks["self_knowledge"] = grounding_context(_grounding_snapshot)
+
+        # Custom blocks are attached after compose(), so compose's internal trim
+        # never saw them. Whole-block trimming would drop the mandatory rules
+        # block before touching grounding, which is the opposite of correct; so
+        # we cap only the unbounded custom content. Observed live: grounding
+        # alone (~15.5k chars) pushed a chat request to 8.8k tokens against an
+        # 8k TPM Groq tier.
+        if self.context_composer.max_tokens > 0:
+            from core.cognitive_engine import cap_custom_block_overage
+            cap_custom_block_overage(context, self.context_composer.max_tokens)
+
         profile_recall = user_profile.try_recall_answer(sanitized_input)
         if profile_recall is None:
             profile_recall = try_explicit_abstain(sanitized_input, user_profile)
 
         stage_started = trace.start_stage()
-        if profile_recall is not None:
+        _generation_selection: Dict[str, Any] = {}
+        _generation_error: Optional[Exception] = None
+        _generation_mode = "unavailable"
+        _latency: Optional[float] = None
+        if _reflex_dispatch is not None:
+            raw_output = (
+                f"Started reflex `{_reflex_dispatch['reflex_id']}` as durable task "
+                f"`{_reflex_dispatch['task_id']}` using promoted procedure "
+                f"`{_reflex_dispatch['procedure_id']}` version "
+                f"{_reflex_dispatch['procedure_version']}. No model planning call was made."
+            )
+            _generation_mode = "reflex_dispatch"
+        elif profile_recall is not None:
             raw_output = profile_recall
+            _generation_mode = "profile_recall"
         elif self.adapter:
             self._emit(EventType.MODEL_REQUESTED, identity_id=identity.id,
                        session_id=session_id, model=self.adapter.model)
@@ -1031,35 +1212,76 @@ class IdentityRuntime:
                 generate_kwargs["execute_tool"] = _execute_tool_call
                 generate_kwargs["tool_choice"] = "auto"
 
+            if _grounding_snapshot is not None:
+                from adapters.contracts import options
+                generate_kwargs.update(options(self.adapter, _grounding_snapshot))
             model_input = user_profile.augment_recall_input(sanitized_input)
+            from adapters.contracts import compatible_kwargs
+            generate_kwargs = compatible_kwargs(self.adapter, generate_kwargs)
             try:
                 raw_output = self.adapter.generate(
                     context=context.render(), user_input=model_input,
                     identity=identity, **generate_kwargs,
                 )
-            except TypeError:
-                raw_output = self.adapter.generate(
-                    context=context.render(), user_input=model_input, identity=identity,
-                )
+            except Exception as exc:
+                # A generation failure must terminate cleanly and defer — never
+                # hang the interaction indefinitely and never surface as an
+                # unhandled HTTP 500 (live-test finding: chain exhaustion used
+                # to propagate straight out of process()).
+                _generation_error = exc
 
-            raw_output = str(raw_output or "")
-            raw_output = re.sub(r"\[Thought\]", "<thought>", raw_output, flags=re.IGNORECASE)
-            raw_output = re.sub(r"\[/Thought\]", "</thought>", raw_output, flags=re.IGNORECASE)
-            if raw_output.count("<thought>") > raw_output.count("</thought>"):
-                raw_output += "\n</thought>"
+            if _generation_error is None:
+                _generation_mode = "identity_model_generation"
+                raw_output = str(raw_output or "")
+                raw_output = re.sub(r"\[Thought\]", "<thought>", raw_output, flags=re.IGNORECASE)
+                raw_output = re.sub(r"\[/Thought\]", "</thought>", raw_output, flags=re.IGNORECASE)
+                if raw_output.count("<thought>") > raw_output.count("</thought>"):
+                    raw_output += "\n</thought>"
+            else:
+                raw_output = ""
 
             _latency = _time_mod.monotonic() - _t0
-            self._emit(EventType.MODEL_RESPONDED, identity_id=identity.id,
-                       session_id=session_id, model=self.adapter.model,
-                       response_length=len(raw_output), latency_ms=round(_latency * 1000))
+            # Which provider actually generated the reply — never assume the
+            # chain head did (a fallback chain reports the real selection).
+            _generation_selection = getattr(self.adapter, "last_selection", None) or {
+                "provider": type(self.adapter).__name__,
+                "model": str(getattr(self.adapter, "model", "") or ""),
+                "attempted": [],
+            }
+            if _generation_error is not None:
+                _generation_selection = dict(_generation_selection)
+                _generation_selection["error"] = str(_generation_error)
+                self._emit_subsystem_failure(
+                    "model_generation",
+                    _generation_error,
+                    identity_id=identity.id,
+                    session_id=session_id,
+                )
+            else:
+                self._emit(EventType.MODEL_RESPONDED, identity_id=identity.id,
+                           session_id=session_id,
+                           model=_generation_selection.get("model") or self.adapter.model,
+                           response_length=len(raw_output), latency_ms=round(_latency * 1000))
         else:
             raw_output = f"[No adapter configured. Context prepared for {identity.name}]"
         trace.end_stage("model", stage_started)
 
+        if _generation_error is not None:
+            raw_output = (
+                "[Generation unavailable] The model runtime could not generate a reply "
+                f"({type(_generation_error).__name__}). The request is deferred; no reply was produced."
+            )
+
         _has_evidence = bool(_evidence_results)
 
         stage_started = trace.start_stage()
-        if not _prometheus_evolved and self.prometheus and self.adapter:
+        if (
+            _reflex_dispatch is None
+            and not _prometheus_evolved
+            and self.prometheus
+            and request.channel_context is None
+            and self.adapter
+        ):
             try:
                 _post = self.prometheus.post_check_and_evolve(
                     response=raw_output, user_input=sanitized_input,
@@ -1076,6 +1298,16 @@ class IdentityRuntime:
                     session_id=session_id,
                 )
         trace.end_stage("prometheus_post", stage_started)
+
+        if _grounding_snapshot is not None and not _has_evidence:
+            # The snapshot-citation contract exists to stop unverifiable
+            # SELF claims. When this turn already has verified tool evidence,
+            # the evidence itself is the contract; forcing prose through the
+            # citation validator would dump the tracking card over a perfectly
+            # sound, evidenced answer (live chat finding).
+            raw_output, _grounding_metadata = guard_response(raw_output, _grounding_snapshot, current=_self_reader.snapshot())
+            if _grounding_metadata['guard'] == 'fallback':
+                _generation_mode = 'runtime_grounded_fallback'
 
         if _has_evidence:
             _fails = sum(1 for r in _evidence_results if not r["success"])
@@ -1124,8 +1356,11 @@ class IdentityRuntime:
                    memory_id=episodic.id, memory_type=episodic.memory_type.value,
                    content=episodic.content[:200])
 
+        # Assistant descriptions of a transient interface must not become
+        # canonical semantic facts or permanent personality mutations.
         semantic_mem = self._extract_and_store_semantic_memory(
-            user_input=sanitized_input, output=final_output,
+            user_input=sanitized_input,
+            output=final_output if request.channel_context is None else "",
             identity_id=identity.id, session_id=session_id, user_id=user_id,
         )
 
@@ -1137,7 +1372,9 @@ class IdentityRuntime:
             self.mutation_engine.fact_store = fact_store
 
         mutation_proposals = self.mutation_engine.analyze(
-            user_input=sanitized_input, assistant_response=final_output, identity_spec=identity,
+            user_input=sanitized_input,
+            assistant_response=final_output if request.channel_context is None else "",
+            identity_spec=identity,
         )
         validated_mutations: List[MutationProposal] = []
         if mutation_proposals:
@@ -1263,6 +1500,25 @@ class IdentityRuntime:
                     session_id=session_id,
                 )
 
+        generation_provenance = {
+            "generation_mode": _generation_mode,
+            "self_knowledge": _grounding_metadata,
+            "provider": str(_generation_selection.get("provider", "")),
+            "model": str(_generation_selection.get("model", "")),
+            "latency_ms": round(_latency * 1000) if _latency is not None else None,
+            "attempted": list(_generation_selection.get("attempted", [])),
+            "memory_ids": list(context.source_ids.get("memory", [])),
+            "recent_message_ids": list(context.source_ids.get("recent", [])),
+            "fact_ids": list(context.source_ids.get("facts", [])),
+            "policy": {
+                "input_allowed": input_policy.allowed,
+                "input_policies": list(input_policy.applied_policies),
+                "output_allowed": output_policy.allowed,
+                "output_policies": list(output_policy.applied_policies),
+            },
+            "output_message_id": episodic.id,
+        }
+
         return InteractionResponse(
             request_id=request.id, identity_id=identity.id, user_id=user_id, output=final_output,
             context_used=context, policy_passed=policy_passed, eval_score=eval_report.overall_score,
@@ -1270,6 +1526,8 @@ class IdentityRuntime:
                 "timings_ms": timings,
                 "debug_request_id": request.id if debug_recorded else None,
                 "capability_results": [dict(item) for item in _evidence_results],
+                "reflex": dict(_reflex_dispatch) if _reflex_dispatch else None,
+                "generation_provenance": generation_provenance,
             },
         )
 

@@ -29,6 +29,7 @@ class ComposedContext:
     session_mode_block: str = ""
     memory_block: str = ""
     skills_block: str = ""
+    installed_capabilities_block: str = ""
     goals_block: str = ""
     intentions_block: str = ""
     relationships_block: str = ""
@@ -38,6 +39,12 @@ class ComposedContext:
     time_awareness_block: str = ""
     custom_blocks: Dict[str, str] = field(default_factory=dict)
     evidence_footer_block: str = ""
+    # Provenance of what the context actually selected, by source:
+    #   "memory"  — long-term/semantic fragments included in the prompt
+    #   "recent"  — working-memory (recent conversation) fragment IDs
+    #   "facts"   — identity fact-store record IDs rendered into the prompt
+    # Lets callers prove which context a generation was grounded in.
+    source_ids: Dict[str, list] = field(default_factory=dict)
 
     def render(self, separator: str = "\n\n") -> str:
         sections = []
@@ -48,6 +55,7 @@ class ComposedContext:
         if self.emotion_block: sections.append(self.emotion_block)
         if self.user_knowledge_block: sections.append(self.user_knowledge_block)
         if self.memory_block: sections.append(self.memory_block)
+        if self.installed_capabilities_block: sections.append(self.installed_capabilities_block)
         if self.skills_block: sections.append(self.skills_block)
         if self.goals_block: sections.append(self.goals_block)
         if self.intentions_block: sections.append(self.intentions_block)
@@ -63,6 +71,30 @@ class ComposedContext:
 
     def token_estimate(self, chars_per_token: float = 4.0) -> int:
         return int(len(self.render()) / chars_per_token)
+
+def cap_custom_block_overage(ctx: "ComposedContext", max_tokens: int) -> Optional[str]:
+    """Truncate the largest custom block to bring the render back under budget.
+
+    Called after callers attach custom blocks (which happens after compose()).
+    Whole-block trimming would drop mandatory directive blocks first, so the
+    largest custom block gets a partial truncation instead. Keeps standard
+    blocks intact; an over-budget *request* is a hard provider failure while
+    a shorter grounding snapshot is honest and still useful.
+    """
+    if max_tokens <= 0 or not ctx.custom_blocks:
+        return None
+    marker = "\n[... truncated ...]"
+    overage = len(ctx.render()) - max_tokens * 4
+    if overage <= 0:
+        return None
+    name = max(ctx.custom_blocks, key=lambda k: len(ctx.custom_blocks[k]))
+    block = ctx.custom_blocks[name]
+    keep = len(block) - overage - len(marker)
+    if keep <= 0:
+        return None
+    ctx.custom_blocks[name] = block[:keep] + marker
+    return name
+
 
 class ContextComposer:
     def __init__(
@@ -109,13 +141,16 @@ class ContextComposer:
         emotion_state: Optional[Any] = None,
         capability_prompts: Optional[list[str]] = None,
         evidence_results: Optional[list[dict]] = None,
+        channel_context: Optional[Any] = None,
     ) -> ComposedContext:
         ctx = ComposedContext()
+        if channel_context is not None:
+            ctx.custom_blocks["channel"] = channel_context.render()
 
         if self.include_identity:
             ctx.identity_block = self._render_identity(identity)
         if self.include_identity_evolution:
-            ctx.identity_evolution_block = self._render_identity_evolution(identity, fact_store=fact_store)
+            ctx.identity_evolution_block = self._render_identity_evolution(identity, fact_store=fact_store, ctx=ctx)
 
         if session_mode and session_mode != SessionMode.NORMAL:
             label_map = {
@@ -136,6 +171,15 @@ class ContextComposer:
             ctx.emotion_block = emotion_state.to_prompt_block()
 
         parts = [
+            "## ⛔ CRITICAL DIRECTIVE — EVIDENCE GROUNDING (READ FIRST)\n"
+            "You are an agent with access to tools. When a tool returns a verified fact, you MUST report "
+            "ONLY that fact and its direct implications. You are FORBIDDEN from adding any geographical, "
+            "historical, or contextual claims that are NOT in the tool result. "
+            "Example: if datetime.now returns '00:15 CDT in Oklahoma (America/Chicago)', you MUST NOT add "
+            "'Oklahoma has two time zones' or 'the Panhandle uses Mountain Time' unless the tool explicitly "
+            "returned that. Concise, evidence-only answers are MANDATORY. Verbose embellished answers are "
+            "A VIOLATION of your core directive.\n"
+            "\n"
             "## RULES OF ENGAGEMENT (You MUST follow these)\n",
             "### 1. EVIDENCE & CONFIDENCE — YOU MUST NOT FABRICATE\n"
             "You may only state information supported by: user input, memory, or successful capability results.\n"
@@ -144,23 +188,33 @@ class ContextComposer:
             "- If capability confidence < 0.8, state your uncertainty explicitly.\n"
             "- Never convert a tool failure into a factual statement. "
             "If you cannot retrieve data, say so.\n"
-            "- CRITICAL — CAPABILITY HALLUCINATION PROHIBITED: You MUST list ONLY the capabilities "
-            "shown in the '## Live Capability Results' section below. "
-            "Never invent, guess, or fabricate capability names, skill names, or their descriptions. "
-            "If the '## Live Capability Results' section is empty or absent, you have zero capabilities "
-            "available — say so. Do NOT list capabilities from training data or imagination.\n"
-            "- CRITICAL — NEVER CLAIM UNVERIFIED ACTIONS: You may ONLY claim that you ran a command, "
+            "- CRITICAL — CAPABILITY HALLUCINATION PROHIBITED: You MUST distinguish between:\n"
+            "  a) INSTALLED CAPABILITIES — tools the identity POSSESSES (listed in '## Installed Capabilities')\n"
+            "  b) EXECUTION EVIDENCE — tools that ACTUALLY RAN this turn (listed in '## Live Capability Results')\n"
+            "  You may answer questions about what you CAN do from '## Installed Capabilities'.\n"
+            "  You may ONLY claim an action OCCURRED if '## Live Capability Results' proves it.\n"
+            "- NEVER CLAIM UNVERIFIED ACTIONS: You may ONLY claim that you ran a command, "
             "created/installed a capability, read a file, or made any system change if a successful "
             "capability result above proves it. Quote the actual returned output (exit code, stdout, "
             "stderr, file paths). If a command was not found (exit code 127) or a capability failed, "
             "report the real error verbatim. Never describe output you did not receive.\n",
 
-            "### 2. CANONICAL IDENTITY FACTS\n"
+            "### 2. EVIDENCE GROUNDING — NO HALLUCINATED WRAPPERS (CRITICAL)\n"
+            "- When a capability returns a verified fact (e.g., current time, temperature, calculation), "
+            "report ONLY that fact and its direct implications.\n"
+            "- Do NOT add geographical, historical, or contextual claims that are NOT in the capability result.\n"
+            "- Example: if datetime.now returns '14:30 in Oklahoma (CDT)', do NOT add 'Oklahoma has two time zones' "
+            "or 'the Panhandle uses Mountain Time' unless the capability explicitly returned that.\n"
+            "- If the user asks for follow-up context, invoke the appropriate capability rather than guessing.\n"
+            "- Concise, evidence-grounded answers are MANDATORY — verbose embellished answers are PROHIBITED.\n"
+            "- This rule OVERRIDES any tendency to provide 'helpful context' — the user gets the fact, nothing more.\n",
+
+            "### 3. CANONICAL IDENTITY FACTS\n"
             "Your identity facts — preferences, beliefs, traits, communication style — are defined in "
             "the 'Identity (Evolved)' section below. They are YOUR canonical identity state. "
             "They are NOT optional context. They are NOT suggestions. They are YOUR facts.\n",
 
-            "### 3. YOU MUST NEVER DISCLAIM YOUR IDENTITY\n"
+            "### 4. YOU MUST NEVER DISCLAIM YOUR IDENTITY\n"
             "- NEVER say any of these phrases: 'I don't have personal preferences', "
             "'I don't have beliefs', 'As an AI, I don't have...', "
             "'I'm just an AI', 'I can't have preferences', 'I don't have a favorite'.\n"
@@ -171,7 +225,7 @@ class ContextComposer:
             "E.g. if the user says 'your favorite color is orange' but your Identity says blue, "
             "you should politely say your favorite color is blue.\n",
 
-            "### 4. USER KNOWLEDGE VS IDENTITY KNOWLEDGE\n"
+            "### 5. USER KNOWLEDGE VS IDENTITY KNOWLEDGE\n"
             "- Your knowledge about the user is in the 'User Profile' section below. "
             "This is what you know ABOUT the user, not about yourself.\n"
             "- The 'Identity (Evolved)' section contains YOUR facts.\n"
@@ -179,11 +233,11 @@ class ContextComposer:
             "than Identity or User Profile.\n"
             "- For questions about the user (e.g. 'what is MY X'), answer from 'User Profile' first.\n",
 
-            "### 5. HANDLING UNCERTAINTY\n"
+            "### 6. HANDLING UNCERTAINTY\n"
             "- If you genuinely don't know something about the user, say you don't know yet.\n"
             "- Never guess or make up facts about yourself or the user.\n",
 
-            "### 6. SYNTHESIS & PROACTIVE INSIGHT\n"
+            "### 7. SYNTHESIS & PROACTIVE INSIGHT\n"
             "- The 'Synthesis' block below identifies gaps, contradictions, and risks "
             "the user may not have noticed. READ IT CAREFULLY and ACT ON IT.\n"
             "- If the synthesis says a goal is BLOCKED, say so directly: 'Your plan to X "
@@ -193,7 +247,7 @@ class ContextComposer:
             "- Your value comes from noticing what the user hasn't. "
             "A polite assistant is replaceable. One who tells hard truths is not.\n",
 
-            "### 7. AMBIGUITY DETECTION — YOU MUST NEVER ASSUME\n"
+            "### 8. AMBIGUITY DETECTION — YOU MUST NEVER ASSUME\n"
             "- If the user asks about a GitHub repository without specifying an owner, "
             "you MUST ask for clarification. Do NOT guess the owner.\n"
             "- If the user asks about a company, person, city, file, package, branch, "
@@ -204,37 +258,40 @@ class ContextComposer:
             "- Exception: unambiguous references from the current session "
             "(e.g. 'that repo we just discussed') are fine.\n",
 
-            "### 8. CAPABILITY RECALL — EXPLAIN YOUR SOURCES\n"
+            "### 9. CAPABILITY RECALL — EXPLAIN YOUR SOURCES\n"
             "- If asked 'How do you know that?' or 'Which capability gave you that?', "
             "you MUST identify the capability by name and report whether it succeeded or failed.\n"
-            "- Reference the 'Live Capability Results' section for successful calls.\n"
-            "- Reference the 'Capability Failures' section for failed calls.\n"
+            "- Reference the 'Live Capability Results' section for successful calls THIS TURN.\n"
+            "- Reference the 'Capability Failures' section for failed calls THIS TURN.\n"
+            "- For questions about what you CAN do, reference '## Installed Capabilities'.\n"
             "- Report the confidence level: verified (>=0.8), sourced (0.5-0.8), inferred (<0.5).\n"
             "- If you cannot identify the source, state 'I don't know exactly which capability produced that.'\n",
         ]
 
         if capability_prompts:
             parts.append(
-                "### 9. INSTALLED CAPABILITIES — YOU HAVE REAL-TIME SKILLS\n"
-                "- The 'Live Capability Results' section below lists data retrieved by installed skills. "
-                "These are NOT suggestions. They are tools you possess and MUST use.\n"
+                "### 10. INSTALLED CAPABILITIES — YOU HAVE REAL-TIME SKILLS\n"
+                "- '## Installed Capabilities' lists ALL tools the identity possesses.\n"
+                "- '## Live Capability Results' lists ONLY tools that EXECUTED THIS TURN.\n"
                 "- When a user asks for ANY real-time or computed information "
                 "(current time, date, weather, math calculation, file contents, "
                 "web pages, text analysis, GitHub data, unit conversion, etc.), "
-                "CHECK the 'Live Capability Results' section FIRST.\n"
-                "- If a matching result exists, USE IT. "
+                "FIRST check '## Live Capability Results' for matching evidence.\n"
+                "- If evidence exists, USE IT. "
                 "Do NOT say 'I cannot access real-time data' or 'I don't have "
                 "that capability' or 'my training data only goes up to...'.\n"
                 "- You DO have access to real-time data through your installed skills. "
                 "Use them.\n"
+                "- If no evidence exists THIS TURN but a matching skill is INSTALLED, "
+                "invoke it via native tool calling.\n"
                 "- Only say you cannot do something if no matching skill exists "
-                "in the results.\n"
+                "in '## Installed Capabilities'.\n"
                 "- IMPORTANT: If a capability failed (shown in 'Capability Failures'), "
                 "you MUST acknowledge the failure. Do NOT fabricate the data.",
             )
 
         parts.append(
-            "### 10. THOUGHT TAGS — WRAP REASONING IN <thought>...</thought>\n"
+            "### 11. THOUGHT TAGS — WRAP REASONING IN <thought>...</thought>\n"
             "When you need to reason, plan, or work through a problem step-by-step, "
             "wrap your internal reasoning in <thought> tags like this:\n"
             "<thought>First I will check what capabilities are available...</thought>\n"
@@ -247,7 +304,7 @@ class ContextComposer:
         )
         
         parts.append(
-            "### 11. TIME AWARENESS & RELATIONSHIP HISTORY\n"
+            "### 12. TIME AWARENESS & RELATIONSHIP HISTORY\n"
             "- Check the 'Time Awareness' section carefully. If it shows you have interacted with this user before, "
             "DO NOT greet them as if it's your first meeting. Do NOT say 'Nice to meet you' or 'Hello, I am X'.\n"
             "- Instead, acknowledge the existing relationship and pick up where you left off.\n"
@@ -255,7 +312,7 @@ class ContextComposer:
         )
         
         parts.append(
-            "### 12. NO TOOL SIMULATION, FAKE JSON, OR CODE SCRIPTS (CRITICAL)\n"
+            "### 13. NO TOOL SIMULATION, FAKE JSON, OR CODE SCRIPTS (CRITICAL)\n"
             "- NEVER output fake JSON, fake exit codes, or fake tool outputs in your text response.\n"
             "- NEVER write Python, Bash, or shell scripts to 'simulate' or 'demonstrate' using a skill. You are NOT a code generator for your own tools.\n"
             "- NEVER say 'I will now run X' and then immediately write the result in your text or write a script that 'would' do it.\n"
@@ -266,7 +323,7 @@ class ContextComposer:
         )
         
         parts.append(
-            "### 13. GITHUB & EXTERNAL REPOSITORIES\n"
+            "### 14. GITHUB & EXTERNAL REPOSITORIES\n"
             "- NEVER use local filesystem paths (like `/home/user/...` or `C:\\...` or directory names from `ls`) as GitHub repository owners or names.\n"
             "- A local directory name is NOT a GitHub repository. If the user asks about a GitHub repo, you MUST ask for the exact `owner/repo` name unless it is explicitly provided in the context.\n"
             "- Do not guess GitHub repository names based on the current working directory.\n"
@@ -285,6 +342,7 @@ class ContextComposer:
                 top_k_memories,
                 session_id,
                 user_id,
+                ctx=ctx,
             )
 
         if self.include_skills:
@@ -292,6 +350,19 @@ class ContextComposer:
                 ctx.skills_block = "\n".join(capability_prompts)
             elif skill_registry:
                 ctx.skills_block = skill_registry.to_prompt_manifest()
+
+        # Installed Capabilities Inventory (separate from execution evidence)
+        if capability_prompts:
+            lines = ["## Installed Capabilities"]
+            for prompt in capability_prompts:
+                # Extract capability names from prompts
+                for line in prompt.split('\n'):
+                    if line.strip().startswith('## ') and 'Skills' in line:
+                        cap_name = line.replace('## ', '').replace(' Skills', '').strip()
+                        lines.append(f"- {cap_name}")
+                        break
+            if len(lines) > 1:
+                ctx.installed_capabilities_block = "\n".join(lines)
 
         if self.include_goals and goal_engine:
             ctx.goals_block = goal_engine.to_prompt_summary(identity.id)
@@ -344,50 +415,79 @@ class ContextComposer:
             ctx.evidence_footer_block = self._render_evidence_footer(evidence_results)
 
         if self.max_tokens > 0:
-            blocks = [
-                ("runtime_directives_block", ctx.runtime_directives_block),
-                ("identity_block", ctx.identity_block),
-                ("identity_evolution_block", ctx.identity_evolution_block),
-                ("user_knowledge_block", ctx.user_knowledge_block),
-                ("emotion_block", ctx.emotion_block),
-                ("session_mode_block", ctx.session_mode_block),
-                ("memory_block", ctx.memory_block),
-                ("skills_block", ctx.skills_block),
-                ("goals_block", ctx.goals_block),
-                ("intentions_block", ctx.intentions_block),
-                ("relationships_block", ctx.relationships_block),
-                ("motivations_block", ctx.motivations_block),
-                ("timeline_block", ctx.timeline_block),
-                ("synthesis_block", ctx.synthesis_block),
-                ("evidence_footer_block", ctx.evidence_footer_block),
-            ]
-            for _name, _block in list(ctx.custom_blocks.items()):
-                blocks.append((f"custom:{_name}", _block))
-
-            total_chars = sum(len(b) for _, b in blocks)
-            budget_chars = self.max_tokens * 4
-            if total_chars > budget_chars:
-                overage = total_chars - budget_chars
-                _protected = frozenset({"identity_block", "user_knowledge_block"})
-                blocks.sort(key=lambda x: -len(x[1]))
-                for name, block in blocks:
-                    if overage <= 0:
-                        break
-                    if not block:
-                        continue
-                    if name in _protected:
-                        continue
-                    if isinstance(name, str) and name.startswith("custom:"):
-                        continue
-                    b_len = len(block)
-                    if b_len <= overage:
-                        setattr(ctx, name, "")
-                        overage -= b_len
-                    else:
-                        keep = b_len - overage
-                        setattr(ctx, name, block[:keep] + "\n[... truncated ...]")
-                        overage = 0
+            self.apply_budget(ctx, self.max_tokens)
         return ctx
+
+    @staticmethod
+    def apply_budget(ctx: "ComposedContext", max_tokens: int) -> None:
+        """Trim *ctx* in place to roughly ``max_tokens``.
+
+        Standard blocks go first (largest first), protected identity and user
+        knowledge stay intact, and custom blocks are trimmed last — they carry
+        potentially unbounded grounding snapshots that otherwise push the
+        composed prompt past provider token budgets (live finding: an 8.8k
+        token request against an 8k-TPM tier).
+        """
+        blocks = [
+            ("runtime_directives_block", ctx.runtime_directives_block),
+            ("identity_block", ctx.identity_block),
+            ("identity_evolution_block", ctx.identity_evolution_block),
+            ("user_knowledge_block", ctx.user_knowledge_block),
+            ("emotion_block", ctx.emotion_block),
+            ("session_mode_block", ctx.session_mode_block),
+            ("memory_block", ctx.memory_block),
+            ("installed_capabilities_block", ctx.installed_capabilities_block),
+            ("skills_block", ctx.skills_block),
+            ("goals_block", ctx.goals_block),
+            ("intentions_block", ctx.intentions_block),
+            ("relationships_block", ctx.relationships_block),
+            ("motivations_block", ctx.motivations_block),
+            ("timeline_block", ctx.timeline_block),
+            ("synthesis_block", ctx.synthesis_block),
+            ("evidence_footer_block", ctx.evidence_footer_block),
+        ]
+        for _name, _block in list(ctx.custom_blocks.items()):
+            blocks.append((f"custom:{_name}", _block))
+
+        total_chars = sum(len(b) for _, b in blocks)
+        budget_chars = max_tokens * 4
+        if total_chars <= budget_chars:
+            return
+        overage = total_chars - budget_chars
+        _protected = frozenset({"identity_block", "user_knowledge_block"})
+        blocks.sort(key=lambda x: -len(x[1]))
+        for name, block in blocks:
+            if overage <= 0:
+                break
+            if not block:
+                continue
+            if name in _protected:
+                continue
+            if name.startswith("custom:"):
+                continue  # trimmed in the second pass below
+            b_len = len(block)
+            if b_len <= overage:
+                setattr(ctx, name, "")
+                overage -= b_len
+            else:
+                keep = b_len - overage
+                setattr(ctx, name, block[:keep] + "\n[... truncated ...]")
+                overage = 0
+        if overage <= 0:
+            return
+        for key in sorted(ctx.custom_blocks, key=lambda k: -len(ctx.custom_blocks[k])):
+            if overage <= 0:
+                break
+            block = ctx.custom_blocks[key]
+            if not block:
+                continue
+            keep = len(block) - overage
+            if keep <= 0:
+                ctx.custom_blocks[key] = ""
+                overage -= len(block)
+            else:
+                ctx.custom_blocks[key] = block[:keep] + "\n[... truncated ...]"
+                overage = 0
 
     def _render_evidence_footer(self, evidence_results: list[dict]) -> str:
         lines = ["---", "### Evidence Sources"]
@@ -437,7 +537,8 @@ class ContextComposer:
         return "\n".join(lines)
 
     def _render_identity_evolution(
-        self, identity: "IdentitySpec", fact_store: Optional[Any] = None
+        self, identity: "IdentitySpec", fact_store: Optional[Any] = None,
+        ctx: Optional["ComposedContext"] = None,
     ) -> str:
         if fact_store is None:
             return ""
@@ -450,7 +551,10 @@ class ContextComposer:
         active_facts = fact_store.active()
         if active_facts:
             has_any = True
+            rendered_ids = ctx.source_ids.setdefault("facts", []) if ctx is not None else []
             for f in active_facts:
+                if getattr(f, "id", None):
+                    rendered_ids.append(f.id)
                 confidence_pct = int(f.confidence * 100)
                 reinforced = f" (reinforced {f.times_reinforced}x)" if f.times_reinforced > 0 else ""
                 lines.append(
@@ -463,6 +567,11 @@ class ContextComposer:
         if active_prefs:
             has_any = True
             lines.append("Preferences:")
+            if ctx is not None:
+                rendered_ids = ctx.source_ids.setdefault("facts", [])
+                for f in active_prefs:
+                    if getattr(f, "id", None):
+                        rendered_ids.append(f.id)
             for f in active_prefs:
                 label = f.field.split(".")[-1].replace("_", " ")
                 lines.append(f"  - {label}: {f.value}")
@@ -533,6 +642,7 @@ class ContextComposer:
         top_k: int,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        ctx: Optional["ComposedContext"] = None,
     ) -> str:
         if identity_id and user_id is not None:
             all_frags = store.by_user(identity_id, user_id)
@@ -557,6 +667,10 @@ class ContextComposer:
         
         if working_memory:
             lines.append("## Recent Conversation (Working Memory)")
+            if ctx is not None:
+                ctx.source_ids.setdefault("recent", []).extend(
+                    f.id for f in working_memory if f.id
+                )
             for frag in reversed(working_memory):
                 lines.append(f"  {frag.content}")
             lines.append("")
@@ -572,6 +686,10 @@ class ContextComposer:
             relevant_past = [(frag, sc) for frag, sc in scored[:top_k] if sc > 1.5]
             if relevant_past:
                 lines.append("## Relevant Past Memories")
+                if ctx is not None:
+                    ctx.source_ids.setdefault("memory", []).extend(
+                        frag.id for frag, _ in relevant_past if frag.id
+                    )
                 for frag, sc in relevant_past:
                     lines.append(f"  [{frag.memory_type.value.upper()}] {frag.content}")
                 lines.append("")
@@ -583,6 +701,10 @@ class ContextComposer:
                 scored = [(f, self._score_memory(f, query)) for f in current_frags]
                 scored.sort(key=lambda x: x[1], reverse=True)
                 lines.append("## This Conversation")
+                if ctx is not None:
+                    ctx.source_ids.setdefault("memory", []).extend(
+                        f.id for f, _ in scored[:top_k] if f.id
+                    )
                 for frag, sc in scored[:top_k]:
                     lines.append(f"  [{frag.memory_type.value.upper()}] {frag.content}")
                 lines.append("")

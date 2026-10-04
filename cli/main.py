@@ -46,6 +46,7 @@ from cli.registry_cmds import (
     cmd_explain,
     cmd_inspect_dashboard,
 )
+from cli.aster_cmds import cmd_aster_wrapper
 from cli.chat_commands import (  # noqa: F401  (re-exported for chat REPL + tests)
     ChatContext,
     dispatch_chat_command,
@@ -251,6 +252,72 @@ def _confirm(prompt: str) -> bool:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+
+def cmd_secret(args: argparse.Namespace) -> int:
+    """
+    Manage secret handles in the IdentityOS secret store.
+
+    The secret store uses opaque handles (e.g. culture-commons/aster) to reference
+    secrets. Plaintext secrets are never displayed, logged, or persisted in identity state.
+    Only the secret store at final execution time resolves handles to plaintext.
+    """
+    from core.secrets.store import SecretStore, default_secret_store_dir
+    from pathlib import Path
+
+    store_dir = default_secret_store_dir(args.project_root if hasattr(args, 'project_root') else ".")
+    store = SecretStore(store_dir)
+
+    if args.secret_command == "set":
+        # Use hidden input to prevent echoing
+        import getpass
+        try:
+            secret = getpass.getpass("Secret: ")
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return 1
+
+        if not secret.strip():
+            print("Error: secret cannot be empty", file=sys.stderr)
+            return 1
+
+        store.put(args.handle, secret)
+        print(f"Stored secret handle: secret://{args.handle}")
+        return 0
+
+    elif args.secret_command == "has":
+        exists = store.has(args.handle)
+        print(f"secret://{args.handle}")
+        print(f"status: {'provisioned' if exists else 'not provisioned'}")
+        if exists:
+            path = store._path(args.handle)
+            mode = path.stat().st_mode & 0o777
+            print(f"mode: {oct(mode)}")
+        return 0
+
+    elif args.secret_command == "list":
+        handles = store.handles()
+        if handles:
+            for h in handles:
+                print(f"secret://{h}")
+        else:
+            print("(no secrets provisioned)")
+        return 0
+
+    elif args.secret_command == "delete":
+        if not _confirm(f"Delete secret://{args.handle}?"):
+            print("Cancelled.")
+            return 0
+        if store.delete(args.handle):
+            print(f"Deleted secret://{args.handle}")
+        else:
+            print(f"Secret not found: {args.handle}")
+        return 0
+
+    else:
+        print("Usage: identity secret <set|has|list|delete>", file=sys.stderr)
+        return 1
+
 
 def cmd_create(args: argparse.Namespace) -> int:
     """
@@ -749,6 +816,7 @@ def _interactive_adapter_select():
     from adapters.openrouter_adapter import OpenRouterAdapter
     from adapters.openai_adapter import OpenAIAdapter, AnthropicAdapter, OllamaAdapter
     from adapters.base import collect_api_keys
+    from adapters.configuration import list_configured_openai_providers
 
     def _has(prefix: str) -> bool:
         return bool(collect_api_keys(prefix))
@@ -761,42 +829,65 @@ def _interactive_adapter_select():
 
     if _has("SAMBANOVA_API_KEY"):
         candidates.append(
-            _probe_adapter("SambaNova", SambaNovaAdapter, os.environ.get("IDENTITY_MODEL", "DeepSeek-V3.1"))
+            _probe_adapter("SambaNova", SambaNovaAdapter,
+                           os.environ.get("SAMBANOVA_MODEL", "DeepSeek-V3.1"))
         )
 
     if _has("CEREBRAS_API_KEY"):
         candidates.append(
-            _probe_adapter("Cerebras", CerebrasAdapter, os.environ.get("IDENTITY_MODEL", "llama3.1-8b"))
+            # Provider-specific model env only. IDENTITY_MODEL names the local
+            # model (e.g. an Ollama tag); sending it to Cerebras is a 404.
+            _probe_adapter("Cerebras", CerebrasAdapter,
+                           os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b"))
         )
 
     if os.environ.get("OPENROUTER_API_KEY"):
         candidates.append(
-            _probe_adapter("OpenRouter", OpenRouterAdapter, os.environ.get("IDENTITY_MODEL", "openai/gpt-4o"))
-        )
-
-    if os.environ.get("OPENAI_API_KEY"):
-        candidates.append(
-            _probe_adapter("OpenAI", OpenAIAdapter, os.environ.get("IDENTITY_MODEL", "gpt-4o"))
+            _probe_adapter("OpenRouter", OpenRouterAdapter,
+                           os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash"))
         )
 
     if os.environ.get("ANTHROPIC_API_KEY"):
         candidates.append(
-            _probe_adapter("Anthropic", AnthropicAdapter, os.environ.get("IDENTITY_MODEL", "claude-3-5-sonnet-20241022"))
+            _probe_adapter("Anthropic", AnthropicAdapter,
+                           os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"))
         )
 
-    # Ollama (local) — auto-start the server if it isn't running, then offer it
-    ollama_ok, ollama_msg = _ensure_ollama_running()
-    ollama_models = _fetch_ollama_models() if ollama_ok else []
-    if ollama_ok:
-        if ollama_models:
-            ollama_model = _resolve_ollama_default_model(ollama_models)
-            candidates.append(_probe_adapter("Ollama (local)", OllamaAdapter, ollama_model))
+    # Discover all OpenAI-compatible providers (OpenAI, Ollama, Gemini, NVIDIA, etc.)
+    openai_providers = list_configured_openai_providers()
+    for provider in openai_providers:
+        name = provider["display_name"]
+        model = provider["model"]
+        is_local = provider["is_local"]
+        base_url = provider["base_url"]
+        api_key = provider["api_key"]
+
+        if is_local:
+            candidates.append(_probe_adapter(name, OllamaAdapter, model, base_url=base_url))
         else:
-            candidates.append(
-                ("Ollama (local)", None, "Ollama: no models pulled (run `ollama pull <model>`)")
-            )
-    else:
-        candidates.append(("Ollama (local)", None, f"Ollama: {ollama_msg}"))
+            # NVIDIA Nemotron models: disable thinking to prevent reasoning leakage
+            extra_body = {}
+            if "nvidia" in name.lower() or "nemotron" in model.lower():
+                extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            candidates.append(_probe_adapter(name, OpenAIAdapter, model, api_key=api_key, base_url=base_url, extra_body=extra_body))
+
+    # Ollama (local) — auto-start the server if it isn't running, then offer it
+    # Only add if not already discovered via OLLAMA_API_KEY
+    has_explicit_ollama = any(p["name"] == "ollama" for p in openai_providers)
+    ollama_models = []
+    if not has_explicit_ollama:
+        ollama_ok, ollama_msg = _ensure_ollama_running()
+        ollama_models = _fetch_ollama_models() if ollama_ok else []
+        if ollama_ok:
+            if ollama_models:
+                ollama_model = _resolve_ollama_default_model(ollama_models)
+                candidates.append(_probe_adapter("Ollama (local)", OllamaAdapter, ollama_model))
+            else:
+                candidates.append(
+                    ("Ollama (local)", None, "Ollama: no models pulled (run `ollama pull <model>`)")
+                )
+        else:
+            candidates.append(("Ollama (local)", None, f"Ollama: {ollama_msg}"))
 
     # Separate working from failed
     working = [(n, a) for n, a, e in candidates if a is not None]
@@ -1012,6 +1103,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # create
+    from cli.phone import add_parser as add_phone_parser
+    add_phone_parser(sub)
+
     p_create = sub.add_parser("create", help="Create a new identity")
     p_create.add_argument("--id", default=None, help="Custom identity id (auto-generated if omitted)")
     p_create.add_argument("--name", required=True, help="Human-readable name")
@@ -1143,6 +1237,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_isp_install.add_argument("id", help="Pack id")
     p_isp_install.add_argument("--identity", required=True, help="Identity id to install on")
 
+
+    # secret
+    p_secret = sub.add_parser("secret", help="Secret store operations")
+    sec_sub = p_secret.add_subparsers(dest="secret_command", required=True)
+    p_sec_set = sec_sub.add_parser("set", help="Store a secret (hidden input)")
+    p_sec_set.add_argument("handle", help="Opaque handle (e.g. culture-commons/aster)")
+    p_sec_set.add_argument("--project-root", default=".", help="Project root for secret store location")
+    p_sec_has = sec_sub.add_parser("has", help="Check if a secret handle is provisioned")
+    p_sec_has.add_argument("handle", help="Opaque handle")
+    p_sec_has.add_argument("--project-root", default=".", help="Project root for secret store location")
+    p_sec_list = sec_sub.add_parser("list", help="List all provisioned secret handles")
+    p_sec_list.add_argument("--project-root", default=".", help="Project root for secret store location")
+    p_sec_del = sec_sub.add_parser("delete", help="Delete a secret")
+    p_sec_del.add_argument("handle", help="Opaque handle")
+    p_sec_del.add_argument("--project-root", default=".", help="Project root for secret store location")
+
+    # aster
+    from cli.aster_cmds import add_aster_parser
+
+    p_aster = sub.add_parser("aster", help="Aster autonomous operator commands")
+    add_aster_parser(p_aster)
+
+    from cli.service_cmds import add_service_parser
+    add_service_parser(sub.add_parser("services", help="Persistent identity services and internal credits"))
+    p_self = sub.add_parser("self", help="Read sanitized authoritative identity state")
+    p_self.add_argument("id")
+    p_self.add_argument("--store", default=DEFAULT_STORE)
+    p_self.add_argument("--backend", default=DEFAULT_BACKEND, choices=["json", "sqlite", "memory"])
+    p_self.add_argument("--section", action="append")
     return parser
 
 
@@ -1211,7 +1334,17 @@ def cmd_isp_wrapper(args: argparse.Namespace) -> int:
 # Entry point
 # ---------------------------------------------------------------------------
 
+from cli.service_cmds import run as cmd_services
+
+def cmd_self(args):
+    from core.self_knowledge import SelfKnowledge
+    print(json.dumps(SelfKnowledge(_get_storage(args), args.id).snapshot(args.section), indent=2, ensure_ascii=False))
+    return 0
+
+
 COMMAND_MAP = {
+    "self": cmd_self,
+    "services": cmd_services,
     "create": cmd_create,
     "inspect": cmd_inspect,
     "debug": cmd_debug,
@@ -1231,12 +1364,17 @@ COMMAND_MAP = {
     "registry": cmd_registry_wrapper,
     "cap": cmd_cap_wrapper,
     "isp": cmd_isp_wrapper,
+    "aster": cmd_aster_wrapper,
+    "secret": cmd_secret,
 }
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "phone":
+        from cli.phone import run
+        return run(args)
     handler = COMMAND_MAP.get(args.command)
     if handler is None:
         parser.print_help()

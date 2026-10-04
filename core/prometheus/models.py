@@ -61,6 +61,8 @@ class RegistryCandidate:
     dependencies: List[str] = field(default_factory=list)
     trust_score: float = 0.0
     relevance_score: float = 0.0
+    behaviorally_verified: bool = False
+    artifact_sha256: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -75,6 +77,8 @@ class RegistryCandidate:
             "dependencies": self.dependencies,
             "trust_score": self.trust_score,
             "relevance_score": self.relevance_score,
+            "behaviorally_verified": self.behaviorally_verified,
+            "artifact_sha256": self.artifact_sha256,
         }
 
 
@@ -96,6 +100,9 @@ class AcquisitionRecord:
     )
     identity_id: str = ""
     mode: AcquisitionMode = AcquisitionMode.AUTOMATIC
+    # Stable provenance for exactly-once reconciliation of durable Executive
+    # tasks. Older inline Prometheus records leave this unset.
+    source_task_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +120,7 @@ class AcquisitionRecord:
             "timestamp": self.timestamp,
             "identity_id": self.identity_id,
             "mode": self.mode.value,
+            "source_task_id": self.source_task_id,
         }
 
 

@@ -382,6 +382,9 @@ class OpenAIAdapter(BaseAdapter):
         max_tokens: int = 1024,
         max_tool_rounds: int = 4,
         timeout: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        reasoning_exclude: bool = True,
+        extra_body: Optional[dict] = None,
         **kwargs
     ):
         if api_key is None:
@@ -395,6 +398,9 @@ class OpenAIAdapter(BaseAdapter):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_tool_rounds = max(1, int(max_tool_rounds))
+        self.reasoning_effort = reasoning_effort
+        self.reasoning_exclude = reasoning_exclude
+        self.extra_body = extra_body or {}
 
         if timeout is None:
             timeout = os.environ.get("OPENAI_TIMEOUT")
@@ -405,20 +411,34 @@ class OpenAIAdapter(BaseAdapter):
         if self._client is None:
             try:
                 import httpx
-                from openai import OpenAI
+                from openai import OpenAI, Timeout
+                # An explicit httpx client with a neutral User-Agent avoids
+                # provider-side bot filtering of the SDK's default headers
+                # (Groq's Cloudflare rejects the default with error 1010).
                 self._client = OpenAI(
                     api_key=self.api_key,
                     base_url=self.base_url,
                     organization=self.organization,
-                    timeout=httpx.Timeout(timeout=self.timeout, connect=5.0),
+                    # Use the SDK's public type: newer SDKs can use a different
+                    # HTTP transport than the project's direct httpx dependency.
+                    timeout=Timeout(timeout=self.timeout, connect=5.0),
                     # Retry policy lives in ``generate`` and provider-specific
                     # adapters. SDK retries would multiply the configured
                     # timeout and make fallback latency unpredictable.
                     max_retries=0,
+                    http_client=httpx.Client(
+                        headers={"User-Agent": "identityos-runtime/1.0"},
+                        timeout=httpx.Timeout(timeout=self.timeout, connect=5.0),
+                    ),
                 )
             except ImportError:
                 raise ImportError("openai package not found. Install with: pip install openai")
         return self._client
+
+    @property
+    def structured_output(self):
+        value = self.config.get("structured_output", "prompt_only")
+        return value if value in {"prompt_only", "json_object", "json_schema"} else "prompt_only"
 
     def generate(
         self,
@@ -432,6 +452,17 @@ class OpenAIAdapter(BaseAdapter):
     ) -> str:
         # Extract execute_tool from kwargs so it doesn't crash the OpenAI client API
         execute_tool = kwargs.pop("execute_tool", None)
+        schema = kwargs.pop("_response_schema", None)
+        budget = kwargs.pop("_generation_budget", None)
+        deadline = _time.monotonic() + max(0.1, float(budget)) if budget is not None else None
+        if deadline is not None:
+            retries = 1
+        if schema and not kwargs.get("tools"):
+            if self.structured_output == "json_schema":
+                kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+                    "name": "identity_expression", "strict": True, "schema": schema}}
+            elif self.structured_output == "json_object":
+                kwargs["response_format"] = {"type": "json_object"}
         
         client = self._get_client()
         messages = [
@@ -469,14 +500,26 @@ class OpenAIAdapter(BaseAdapter):
             shrinks = 0
             while attempt < retries + shrinks:
                 attempt += 1
+                tools_enabled_for_request = bool(kwargs.get("tools")) and kwargs.get("tool_choice") != "none"
                 try:
                     request_kwargs = dict(kwargs)
+                    if deadline is not None:
+                        remaining = deadline - _time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("generation deadline reached")
+                        request_kwargs["timeout"] = min(remaining, float(request_kwargs.get("timeout", self.timeout)))
                     if tool_rounds >= self.max_tool_rounds or plain_text_recovery_used:
                         request_kwargs.pop("tools", None)
                         request_kwargs.pop("tool_choice", None)
                     tools_enabled_for_request = bool(request_kwargs.get("tools")) and (
                         request_kwargs.get("tool_choice") != "none"
                     )
+                    # Add reasoning_effort if configured (for models that support it, e.g., o1, Nemotron)
+                    if self.reasoning_effort and "reasoning_effort" not in request_kwargs:
+                        request_kwargs["reasoning_effort"] = self.reasoning_effort
+                    # Add extra_body if configured (e.g., for NVIDIA Nemotron to disable thinking)
+                    if self.extra_body and "extra_body" not in request_kwargs:
+                        request_kwargs["extra_body"] = self.extra_body
                     response = client.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -611,6 +654,12 @@ class OpenAIAdapter(BaseAdapter):
             choice = response.choices[0]
             message = choice.message
 
+            # Handle reasoning content (e.g., Nemotron, o1 models)
+            reasoning_content = getattr(message, "reasoning_content", None)
+            if self.reasoning_exclude and reasoning_content:
+                # Reasoning is internal — do not expose to user
+                pass
+
             # --- Tool Calling Loop ---
             if getattr(message, "tool_calls", None) and execute_tool:
                 if tool_rounds >= self.max_tool_rounds:
@@ -652,7 +701,8 @@ class OpenAIAdapter(BaseAdapter):
                 tool_rounds += 1
                 continue
 
-            return message.content or ""
+            content = message.content or ""
+            return content
 
         raise RuntimeError(
             f"Adapter tool-call limit reached after {tool_rounds} round(s) without "
@@ -701,10 +751,103 @@ class OpenAIAdapter(BaseAdapter):
     def health_check(self) -> bool:
         try:
             client = self._get_client()
-            client.models.list()
-            return True
+            # Try models.list() first (standard OpenAI)
+            try:
+                client.models.list()
+                return True
+            except Exception as e:
+                # Some providers (Gemini, NVIDIA, etc.) don't support /models endpoint
+                # Fall back to a minimal completion request
+                error_msg = str(e).lower()
+                if any(code in error_msg for code in ("404", "not found", "not supported", "unsupported")):
+                    # Try a minimal request instead
+                    client.chat.completions.create(
+                        model=self.model or "gpt-4o",
+                        messages=[{"role": "user", "content": "hi"}],
+                        max_tokens=1,
+                    )
+                    return True
+                # Re-raise if it's a different error
+                raise
         except Exception:
             return False
+
+    def generate_with_vision(
+        self,
+        context: str,
+        user_input: str,
+        identity: Any,
+        image_base64: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        retries: int = 3,
+        **kwargs
+    ) -> str:
+        """
+        Generate a response from the LLM with vision (image) input.
+
+        Uses OpenAI-compatible vision API (GPT-4o, GPT-4 Turbo with vision, etc.)
+        """
+        client = self._get_client()
+        model = self.model or "gpt-4o"
+        last_exc = None
+        effective_max = max_tokens or self.max_tokens
+
+        # Build messages with image
+        messages = [
+            {"role": "system", "content": context},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_input},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{image_base64}",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ]
+
+        for attempt in range(retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature or self.temperature,
+                    max_tokens=effective_max,
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                msg_lower = msg.lower()
+                if "rate limit" in msg_lower or "429" in msg:
+                    if attempt < retries:
+                        wait = 2 ** attempt * 5
+                        logger.warning("Rate limited, retrying in %ds...", wait)
+                        _time.sleep(wait)
+                    continue
+                if _is_token_limit_error(msg) and effective_max and effective_max > 256:
+                    effective_max = max(256, effective_max // 2)
+                    logger.warning(
+                        "Token-limit rejection (max_tokens shrunk to %d): %.120s",
+                        effective_max, msg,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Adapter vision error (model={model!r}, base_url={self.base_url!r}): {msg}"
+                ) from exc
+
+        if response is None:
+            raise RuntimeError(f"Adapter vision error: no response from {model}")
+
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content or ""
+        return content
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -735,7 +878,11 @@ class AnthropicAdapter(BaseAdapter):
         kwargs.pop("execute_tool", None)
         kwargs.pop("tools", None)
         kwargs.pop("tool_choice", None)
+        kwargs.pop("_response_schema", None)
+        budget = kwargs.pop("_generation_budget", None)
         client = self._get_client()
+        if budget is not None:
+            client = client.with_options(timeout=max(0.1, float(budget)), max_retries=0)
         model = self.model or "claude-3-5-sonnet-20241022"
         try:
             response = client.messages.create(
