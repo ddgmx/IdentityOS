@@ -1,11 +1,36 @@
 from __future__ import annotations
 
 import shlex
+import os
 import subprocess
 from typing import Any, Optional
 from core.capabilities.base import Capability, Skill
 from core.capabilities.registry import register
 from core.capabilities.result import CapabilityResult
+
+
+def _split_command(command: str) -> list[str]:
+    """Parse arguments with the host OS rules without invoking a shell."""
+    if os.name != "nt":
+        return shlex.split(command)
+
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    count = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(count))
+    if not argv:
+        raise OSError(ctypes.get_last_error(), "CommandLineToArgvW failed")
+    try:
+        return [argv[index] for index in range(count.value)]
+    finally:
+        kernel32.LocalFree(argv)
 
 
 @register
@@ -57,7 +82,7 @@ class CommandExecCapability(Capability):
             return {"error": "No command provided", "exit_code": -1, "stdout": "", "stderr": "command is empty"}
         try:
             proc = subprocess.run(
-                shlex.split(command),
+                _split_command(command),
                 shell=False,
                 capture_output=True,
                 text=True,
