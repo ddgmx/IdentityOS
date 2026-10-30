@@ -31,3 +31,12 @@ def test_policy_supplied_to_manager_is_snapshotted():
     policy.allowed.append("delete:records")
     assert manager.check("read:records")
     assert not manager.check("delete:records")
+
+
+def test_nested_metadata_is_detached_both_directions():
+    source = {"metadata": {"audit": [{"details": ["original"]}]}}
+    manager = PermissionManager.from_dict(source)
+    source["metadata"]["audit"][0]["details"].append("input edit")
+    exported = manager.to_dict()
+    exported["metadata"]["audit"][0]["details"].append("output edit")
+    assert manager.to_dict()["metadata"] == {"audit": [{"details": ["original"]}]}
