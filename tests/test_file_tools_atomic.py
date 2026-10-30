@@ -26,3 +26,14 @@ def test_failed_replace_keeps_original_and_cleans_temporary_file(tmp_path):
     assert not result.success
     assert target.read_text(encoding="utf-8") == "original"
     assert list(tmp_path.iterdir()) == [target]
+
+
+def test_failed_flush_keeps_original_and_cleans_temporary_file(tmp_path):
+    tool = FileToolsCapability({"allowed_roots": [str(tmp_path)]})
+    target = tmp_path / "note.txt"
+    target.write_text("original", encoding="utf-8")
+    with patch("core.capabilities.file_tools.os.fsync", side_effect=OSError("disk full")):
+        result = tool.call("file_tools.write_file", path=str(target), content="new")
+    assert not result.success
+    assert target.read_text(encoding="utf-8") == "original"
+    assert list(tmp_path.iterdir()) == [target]
