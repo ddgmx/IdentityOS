@@ -12,7 +12,8 @@ def test_write_reports_encoded_bytes_and_replace(tmp_path):
     assert first["status"] == "created"
     assert first["bytes_written"] == 2
     second = tool._write_file(str(target), "new")
-    assert second["status"] == "replaced"
+    assert second["status"] == "created"  # Existing response contract.
+    assert second["operation"] == "replaced"
     assert target.read_text(encoding="utf-8") == "new"
 
 
