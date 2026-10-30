@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Any, Optional
 
 from core.capabilities.base import Capability, Skill
@@ -107,12 +108,25 @@ class FileToolsCapability(Capability):
             return {"error": "path is required"}
         resolved = resolve_workspace_path(path, self._config)
         os.makedirs(resolved.parent, exist_ok=True)
-        with resolved.open("w") as f:
-            f.write(content)
+        existed = resolved.exists()
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=resolved.parent,
+                prefix=f".{resolved.name}.", delete=False,
+            ) as f:
+                temporary = f.name
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, resolved)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
         return {
             "path": str(resolved),
-            "bytes_written": len(content),
-            "status": "created" if resolved.is_file() else "error",
+            "bytes_written": len(content.encode("utf-8")),
+            "status": "replaced" if existed else "created",
         }
 
     def _append_file(self, path: str = "", content: str = "", **kwargs: Any) -> dict[str, Any]:
