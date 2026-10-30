@@ -22,6 +22,10 @@ Example:
 
 Permissions describe **authority**, not behavior.
 Policies describe behavior; permissions describe authorization.
+
+PermissionManager snapshots supplied policies and returns detached dictionaries.
+Call grant/deny/revoke and assign_role/unassign_role to change live authority;
+editing the original policy or a serialized view does not update the manager.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ class PermissionPolicy:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a detached snapshot suitable for persistence or inspection."""
         return {
             "allowed": list(self.allowed),
             "denied": list(self.denied),
@@ -57,6 +62,7 @@ class PermissionPolicy:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PermissionPolicy":
+        """Load a policy without retaining mutable references to input data."""
         return cls(
             allowed=list(data.get("allowed", [])),
             denied=list(data.get("denied", [])),
@@ -93,6 +99,7 @@ class PermissionManager:
     }
 
     def __init__(self, policy: Optional[PermissionPolicy] = None) -> None:
+        """Snapshot the supplied policy; later edits to it are not grants."""
         self._policy = PermissionPolicy.from_dict(policy.to_dict()) if policy is not None else PermissionPolicy()
 
     def grant(self, scope: str) -> None:
