@@ -22,11 +22,16 @@ Example:
 
 Permissions describe **authority**, not behavior.
 Policies describe behavior; permissions describe authorization.
+
+PermissionManager snapshots supplied policies and returns detached dictionaries.
+Call grant/deny/revoke and assign_role/unassign_role to change live authority;
+editing the original policy or a serialized view does not update the manager.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from typing import Any, Optional
 
 
@@ -47,20 +52,22 @@ class PermissionPolicy:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a detached snapshot suitable for persistence or inspection."""
         return {
-            "allowed": self.allowed,
-            "denied": self.denied,
-            "roles": self.roles,
-            "metadata": self.metadata,
+            "allowed": list(self.allowed),
+            "denied": list(self.denied),
+            "roles": list(self.roles),
+            "metadata": deepcopy(self.metadata),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PermissionPolicy":
+        """Load a policy without retaining mutable references to input data."""
         return cls(
-            allowed=data.get("allowed", []),
-            denied=data.get("denied", []),
-            roles=data.get("roles", []),
-            metadata=data.get("metadata", {}),
+            allowed=list(data.get("allowed", [])),
+            denied=list(data.get("denied", [])),
+            roles=list(data.get("roles", [])),
+            metadata=deepcopy(data.get("metadata", {})),
         )
 
 
@@ -92,7 +99,8 @@ class PermissionManager:
     }
 
     def __init__(self, policy: Optional[PermissionPolicy] = None) -> None:
-        self._policy = policy or PermissionPolicy()
+        """Snapshot the supplied policy; later edits to it are not grants."""
+        self._policy = PermissionPolicy.from_dict(policy.to_dict()) if policy is not None else PermissionPolicy()
 
     def grant(self, scope: str) -> None:
         """Grant a permission scope."""
@@ -187,8 +195,8 @@ class PermissionManager:
             role_perms.extend(self.ROLE_DEFINITIONS.get(role, []))
 
         return {
-            "allowed": self._policy.allowed,
-            "denied": self._policy.denied,
+            "allowed": list(self._policy.allowed),
+            "denied": list(self._policy.denied),
             "from_roles": list(set(role_perms)),
         }
 
